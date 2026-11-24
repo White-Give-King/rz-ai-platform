@@ -163,6 +163,63 @@ def test_classify():
   assert feishu.classify('【RZ-FS-A3数据中心速报】\n已通报二线工程师') == 'sos'
   assert feishu.classify('今天进展怎么样') == 'other'
 
+  # 日常运维群的人发变更通知 → change（**最先判**，否则平湖第 8 项「通报：」会被算成 first）
+  assert feishu.classify('【变更开始-通知】 | 变更工单号：RZKJ-LF-A1-…') == 'change'
+  assert feishu.classify('【变更完成-通知】 | 变更工单号：RZKJ-LF-A1-…') == 'change'
+  assert feishu.classify(
+    '【ET15机房Y楼-维护通告】开启\n1、标题：低压柜季度预防性维护\n'
+    '8、通报：已告知值班人员，驻场人员，IT人员') == 'change'
+  assert feishu.classify('【 ET15机房Z楼-变更通告】-开启\n1、标题：PDU 压测') == 'change'
+  assert feishu.classify('【变更开始-A1-M2-403机房机柜加电阈值设置】') == 'change'
+  assert feishu.classify('【变更结束-A1-M2-403机房机柜上电变更操作】') == 'change'
+  assert feishu.classify('<p>【变更开始-A1-M1-AB系统A路三相相电压阈值】</p>') == 'change'
+  assert feishu.classify('【维修变更开始】\n【故障维修单号】RZKJ-HZ-…') == 'change'
+  # 噪声（值班名单/天气/说明）不含变更通知头 → 仍判 other
+  assert feishu.classify('A-1 11月19日 白班值班人员：供配电：…') == 'other'
+  assert feishu.classify('*** 今日天气*** LF-8℃/-3℃') == 'other'
+
+
+def test_classify_by_chat():
+  """日常运维群按群身份判类：只可能是 change/other，绝不产出 sos/first。"""
+  orig_change = feishu.settings.CHANGE_NOTICE_FEISHU_PARK_CHATS
+  orig_incident = feishu.settings.INCIDENT_FEISHU_PARK_CHATS
+  change_chat, incident_chat = 'oc_change', 'oc_incident'
+  try:
+    feishu.settings.CHANGE_NOTICE_FEISHU_PARK_CHATS = f'{{"廊坊":"{change_chat}"}}'
+    feishu.settings.INCIDENT_FEISHU_PARK_CHATS = f'{{"廊坊":"{incident_chat}"}}'
+
+    # 日常群：正文带「通报/速报」也只可能是 other —— 这些群不参与告警匹配
+    assert feishu.classify('【RZ-LF-A12数据中心通报】', change_chat) == 'other'
+    assert feishu.classify('【RZ-FS-A3数据中心速报】\n已通报二线', change_chat) == 'other'
+    assert feishu.classify('A-1 值班人员：供配电：…', change_chat) == 'other'
+    # 四种变更头照常判 change
+    assert feishu.classify('【变更开始-通知】 | 变更工单号：RZKJ-LF-A1-…',
+                           change_chat) == 'change'
+    assert feishu.classify('【ET15机房Y楼-维护通告】开启\n1、标题：低压柜巡检',
+                           change_chat) == 'change'
+    assert feishu.classify('【变更开始-A1-M2-403机房机柜加电】', change_chat) == 'change'
+    assert feishu.classify('【维修变更开始】\n【故障维修单号】RZKJ-HZ-…',
+                           change_chat) == 'change'
+
+    # 应急群走原文本分支，完全不受影响
+    assert feishu.classify('【RZ-LF-A12数据中心通报】', incident_chat) == 'first'
+    assert feishu.classify('【RZ-FS-A3数据中心速报】', incident_chat) == 'sos'
+
+    # 同一 chat_id 两边都配了 → 应急优先
+    feishu.settings.CHANGE_NOTICE_FEISHU_PARK_CHATS = f'{{"廊坊":"{incident_chat}"}}'
+    assert feishu.is_change_chat(incident_chat) is False
+    assert feishu.classify('【RZ-LF-A12数据中心通报】', incident_chat) == 'first'
+
+    # 端到端：行构造同样按群身份判 kind
+    feishu.settings.CHANGE_NOTICE_FEISHU_PARK_CHATS = f'{{"廊坊":"{change_chat}"}}'
+    row = feishu.build_report_row(
+      chat_id=change_chat, message_id='m1', create_s=_T0,
+      text='【RZ-LF-A12数据中心通报】机房温度过高')
+    assert row['kind'] == 'other'
+  finally:
+    feishu.settings.CHANGE_NOTICE_FEISHU_PARK_CHATS = orig_change
+    feishu.settings.INCIDENT_FEISHU_PARK_CHATS = orig_incident
+
 
 def test_report_field():
   # 报文布局按《3.2.1 事件管理流程》表 2-2 的实际字段名
@@ -481,6 +538,29 @@ def test_label_normalization():
     '【发生时间】\n2026年10月5日01:45:04',
   ):
     assert feishu.parse_event_time(text) == want, text
+
+
+_FS_REPORT = (
+  '【RZ-FS-A1数据中心事件通报】\n'
+  '【\n事件概述\n】\n'
+  '佛山润泽园区A1数据中心室外一层M1柴发-A1-E3直流屏-系统总故障-模块故障告警\n'
+  '发生时间\n2026年11月13日13时41分33秒\n'
+  '事件来源\n动环报警\n'
+  '进展同步1\n通报时间\n2026年11月13日13时45分59秒'
+)
+
+
+def test_parse_event_time_bare_label_line():
+  """裸标签兜底：标签独占一行、值在下一行（无【】、无冒号）。
+
+  真实的佛山卡片是「拆元素带括号」形态（见 `test_card_bracket_elements_not_deduped`），
+  这里只锁 `_bare_labeled` 对真正无括号变体的兜底能力。
+  """
+  assert feishu.parse_event_time(_FS_REPORT) == _ts(2026, 11, 13, 13, 41, 33)
+  # 「通报时间」不在 _TIME_LABELS 里，不会被当成发生时间
+  assert '通报时间' not in feishu._TIME_LABELS
+  # 裸标签兜底只服务发生时间：括号换行写法仍由 `_labeled` 取值，不能吃到 `]`
+  assert feishu._labeled(_FS_REPORT, ('事件概述',)).startswith('佛山润泽')
 
 
 def test_report_value_and_room():
@@ -1011,9 +1091,14 @@ def test_incident_tool_window():
   # 带时分 → 精确到分（左闭右开）
   start_s, end_s, _ = it._window('2026-10-21 08:00', '2026-10-21 18:00')
   assert end_s - start_s == 10 * 3600
+  # 只给时刻、不给 end → 该时刻起 1 分钟（用户问「12:55:00 的消息」不能退回整天）
+  start_s, end_s, label = it._window('2026-10-21 08:00', '')
+  assert end_s - start_s == 60 and label == '2026-10-21 08:00 ~ 2026-10-21 08:01'
+  start_s, end_s, label = it._window('2026-10-21 08:00:30', '')
+  assert end_s - start_s == 60 and label == '2026-10-21 08:00:30 ~ 2026-10-21 08:01:30'
 
   for args in (('2026-10-23', '2026-10-20'), ('2026-13-01', ''), ('', '2026-10-22'),
-               ('2026-10-20 08:00', ''), ('2026-10-20', '2026-10-21 08:00')):
+               ('2026-10-20', '2026-10-21 08:00')):
     try:
       it._window(*args)
     except ValueError:
@@ -1305,6 +1390,45 @@ def test_text_from_content():
   assert feishu.text_from_content('text', '') == ''
 
 
+def test_card_bracket_elements_not_deduped():
+  """拆元素卡片：`【` / 标签 / `】 ` / 值 各是一个 text 元素。
+
+  2026-11-13 佛山「发生时间」为空的根因就在这里：旧实现用
+  `'\\n'.join(dict.fromkeys(parts))` 做**跨元素**去重，第二处起的 `【`/`】` 被当成
+  重复丢掉，标签退化成裸行。佛山卡片首字段是「事件概述」→ 括号被它占掉 →
+  `_labeled` 匹配不到发生时间 → `event_time` 落 NULL → 表里留空。
+  （廊坊首字段是「发生时间」，括号恰好落在它身上，所以一直看不出问题。）
+  """
+  from types import SimpleNamespace
+
+  def row(*cells):
+    return [{'tag': 'text', 'text': c} for c in cells]
+
+  card = json.dumps({'elements': [
+    row('【', '事件概述', '】 ', '佛山润泽园区A1数据中心室外一层M1柴发-系统总故障'),
+    row('【', '发生时间', '】 ', '2026年11月13日13时41分33秒'),
+    row('【', '告警值', '】 ', '0.8'),
+  ]}, ensure_ascii=False)
+
+  text = feishu.text_from_content('interactive', card)
+  # 每个字段的括号都要留下（3 个字段 → 3 组括号）
+  assert text.count('【') == 3, text
+  assert text.count('】') == 3, text
+  # 发生时间：括号被事件概述占掉时这里会解析成 None
+  assert feishu.parse_event_time(text, _T0) == int(
+    datetime(2026, 11, 13, 13, 41, 33, tzinfo=_TZ).timestamp())
+  # 同一缺陷的第二个后果：非首字段的告警值也要取得到
+  assert feishu.extract_report_value(text) == 0.8
+
+  # 拉取侧用同一份 JSON（`.body.content`），出口必须同形（`test_realtime_row_shape` 守这条）
+  message = SimpleNamespace(
+    msg_type='interactive', body=SimpleNamespace(content=card),
+    message_id='om_card', create_time=str(_T0 * 1000),
+    sender=SimpleNamespace(sender_name='', id='', id_type=''),
+  )
+  assert feishu.extract_text(message) == text
+
+
 def test_ingest_whitelist():
   """入库开关与白名单：空白名单是 **fail-closed**（不给「默认全收」）。"""
   from config.settings import settings
@@ -1350,7 +1474,10 @@ def test_on_message_event_gating():
       chat_id='oc_a', message_id='om_1', create_time='1728791400000',
       message_type='text', content='{"text":"你好"}',
     ),
-    sender=SimpleNamespace(sender_id=SimpleNamespace(open_id='ou_1', user_id='')),
+    sender=SimpleNamespace(
+      sender_type='user',
+      sender_id=SimpleNamespace(open_id='ou_1', user_id='', app_id=''),
+    ),
   ))
   try:
     client.submit_async = lambda coro: None
@@ -1366,12 +1493,23 @@ def test_on_message_event_gating():
     assert len(calls) == 1
     assert calls[0] == {
       'chat_id': 'oc_a', 'message_id': 'om_1', 'create_s': 1728791400,
-      'open_id': 'ou_1', 'msg_type': 'text', 'content': '{"text":"你好"}',
+      'open_id': 'ou_1', 'app_id': '', 'sender_type': 'user',
+      'msg_type': 'text', 'content': '{"text":"你好"}',
     }
+
+    # 机器人事件：sender_type/app_id 原样透传（_ingest_one 据此判日常群是否入库）
+    event.event.sender = SimpleNamespace(
+      sender_type='app',
+      sender_id=SimpleNamespace(open_id='ou_x', user_id='', app_id='cli_1'),
+    )
+    realtime.on_message_event(event)
+    assert len(calls) == 2
+    assert calls[1]['open_id'] == 'ou_x'
+    assert (calls[1]['app_id'], calls[1]['sender_type']) == ('cli_1', 'app')
 
     event.event.message.chat_id = 'oc_other'
     realtime.on_message_event(event)
-    assert len(calls) == 1                   # 不在白名单 → 不提交
+    assert len(calls) == 2                   # 不在白名单 → 不提交
   finally:
     client.submit_async = old_submit
     realtime._ingest_one = old_ingest
@@ -1505,6 +1643,132 @@ def test_sync_deletes_recalled():
     asyncio.run(sync.sync_range(0, None, backfill=True))
     assert [r['message_id'] for r in saved[0]] == ['om_ok']
     assert deleted == [('oc_a', 'om_r')]
+  finally:
+    for (mod, name), value in originals.items():
+      setattr(mod, name, value)
+
+
+def test_is_bot_sender():
+  """飞书发送者是否机器人：`sender_type=app`，或没给 type 但只有 app_id。"""
+  from service.scheduled_task.incident_stats import realtime
+
+  assert realtime.is_bot_sender('app', 'ou_x', 'cli_1')
+  assert realtime.is_bot_sender('APP', '', 'cli_1')
+  assert realtime.is_bot_sender('', '', 'cli_1')
+  assert not realtime.is_bot_sender('user', 'ou_1', '')
+  assert not realtime.is_bot_sender('', 'ou_1', 'cli_1')
+  assert not realtime.is_bot_sender('', '', '')
+
+
+def test_ingest_one_change_drops_bot():
+  """日常群机器人消息不入库；应急群不受影响（锁住「告警链路不变」）。"""
+  import asyncio
+
+  from service.scheduled_task.incident_stats import realtime
+
+  changed: list[dict] = []
+  incident: list[dict] = []
+
+  async def fake_cluster(chat_id):
+    return '廊坊' if chat_id == 'oc_incident' else ''
+
+  async def fake_sender(open_id):
+    return '张三' if open_id == 'ou_1' else ''
+
+  def fake_save_change(rows):
+    changed.extend(rows)
+    return len(rows)
+
+  def fake_save_incident(rows):
+    incident.extend(rows)
+    return len(rows)
+
+  patches = {
+    (realtime, '_cluster_of'): fake_cluster,
+    (realtime, '_sender_name'): fake_sender,
+    (realtime.feishu, 'is_change_chat'): lambda chat_id: chat_id == 'oc_change',
+    (realtime.change_source, 'save_reports'): fake_save_change,
+    (realtime.source, 'save_reports'): fake_save_incident,
+    (realtime.extract, 'enrich_rows'): _noop_async,
+    (realtime, '_schedule_match'): lambda: None,
+  }
+  originals = {(mod, name): getattr(mod, name) for mod, name in patches}
+  try:
+    for (mod, name), value in patches.items():
+      setattr(mod, name, value)
+
+    # ① 日常群 + 机器人 → 两边都不写
+    asyncio.run(realtime._ingest_one(
+      chat_id='oc_change', message_id='om_bot', create_s=1,
+      open_id='ou_x', app_id='cli_1', sender_type='app',
+      msg_type='text', content='{"text":"普通消息"}'))
+    assert changed == [] and incident == []
+
+    # ② 日常群 + 人 → 写入变更表
+    asyncio.run(realtime._ingest_one(
+      chat_id='oc_change', message_id='om_h', create_s=2,
+      open_id='ou_1', app_id='', sender_type='user',
+      msg_type='text', content='{"text":"普通消息"}'))
+    assert [r['message_id'] for r in changed] == ['om_h']
+    assert changed[0]['sender_id'] == 'ou_1'
+    assert changed[0]['sender_id_type'] == 'open_id'
+    assert changed[0]['sender'] == '张三'
+    assert incident == []
+
+    # ③ 应急园区 + 机器人 → 照旧写应急表（不改告警行为）
+    asyncio.run(realtime._ingest_one(
+      chat_id='oc_incident', message_id='om_i', create_s=3,
+      open_id='ou_y', app_id='cli_1', sender_type='app',
+      msg_type='text', content='{"text":"普通消息"}'))
+    assert [r['message_id'] for r in incident] == ['om_i']
+    assert [r['message_id'] for r in changed] == ['om_h']   # 变更表仍只有人那条
+  finally:
+    for (mod, name), value in originals.items():
+      setattr(mod, name, value)
+
+
+def test_change_sync_drops_bot():
+  """回补路径：机器人（`sender_id_type=app_id`）不入变更表，撤回 id 仍照删。"""
+  import asyncio
+
+  from service.scheduled_task.change_notice import workflow
+
+  saved: list[list[dict]] = []
+  deleted: list[tuple[str, str]] = []
+
+  async def fake_fetch(chat_id, start_s, end_s):
+    rows = [
+      {'chat_id': chat_id, 'message_id': 'om_bot', 'create_time': 1,
+       'sender_id_type': 'app_id'},
+      {'chat_id': chat_id, 'message_id': 'om_h', 'create_time': 2,
+       'sender_id_type': 'open_id'},
+    ]
+    return rows, ['om_r']
+
+  def fake_save(rows):
+    saved.append(rows)
+    return len(rows)
+
+  def fake_delete(chat_id, message_id):
+    deleted.append((chat_id, message_id))
+    return 1
+
+  patches = {
+    (workflow.config, 'park_chat_map'): lambda parks=None: {'廊坊': 'oc_c'},
+    (workflow, '_ensure_schema'): lambda: None,
+    (workflow.feishu, 'fetch_messages'): fake_fetch,
+    (workflow.change_source, 'save_reports'): fake_save,
+    (workflow.change_source, 'delete_report'): fake_delete,
+  }
+  originals = {(mod, name): getattr(mod, name) for mod, name in patches}
+  try:
+    for (mod, name), value in patches.items():
+      setattr(mod, name, value)
+
+    result = asyncio.run(workflow.sync_window(1, 2))
+    assert result == {'saved': 1, 'recalled': 1, 'failed': []}
+    assert [r['message_id'] for r in saved[0]] == ['om_h']   # 机器人那条被丢
+    assert deleted == [('oc_c', 'om_r')]
   finally:
     for (mod, name), value in originals.items():
       setattr(mod, name, value)

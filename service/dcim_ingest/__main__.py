@@ -201,12 +201,14 @@ def _run_processes(processes: int, cluster_list) -> int:
   """起 N 个子进程并看护；任一异常退出就停掉其余进程并返回非零（交给容器重启）。"""
   ctx = multiprocessing.get_context()   # Linux=fork（省内存、秒起）；macOS=spawn
   if settings.DCIM_REALTIME_ENABLED:
-    min_threads = min(realtime_workers(c) for c in cluster_list)
-    if min_threads < processes:
+    # 线程按**扁平序号轮询**分给进程，所以只要总数 ≥ 进程数，每个进程都能分到；
+    # 用「最小园区」判会误报（惠州每集群只有 3 个分区、concurrency=3，但其它园区各 8 条）。
+    realtime_total = sum(realtime_workers(c) for c in cluster_list)
+    if realtime_total < processes:
       logger.warning(
-        '最小园区实时线程数 %d < 进程数 %d：部分进程分不到实时线程，'
-        '建议把该园区的 concurrency 或全局 DCIM_REALTIME_CONCURRENCY 调到 ≥ 进程数',
-        min_threads, processes,
+        '实时线程总数 %d < 进程数 %d：有进程分不到实时线程，'
+        '建议调大 DCIM_REALTIME_CONCURRENCY 或各园区的 concurrency',
+        realtime_total, processes,
       )
 
   children = []

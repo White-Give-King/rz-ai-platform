@@ -83,9 +83,12 @@ TOOL_TITLES: dict[str, str] = {
   'history_read': '读历史归档原文',
   'incident_report': '数据中心事件统计表',
   'incident_progress': '事件进展全记录',
+  'group_message_search': '检索应急群消息原文',
+  'change_notice_report': '每日变更统计',
   'schedule_task': '定时任务管理',
   'event_alarm_link': '事件关联告警',
   'doc_update_check': '文档更新检查',
+  'drill_compliance_audit': '应急演练合规审查',
   'video_create': 'PPT 生成讲解视频',
   'video_create_from_text': '文字生成讲解视频',
   'video_status': '查询视频任务',
@@ -94,7 +97,7 @@ TOOL_TITLES: dict[str, str] = {
   'video_update_pages': '批量改解说词',
   'video_set_options': '设置视频选项',
   'video_rerender': '重新合成视频',
-  'fetch_group_messages': '读飞书群消息',
+  'fetch_group_messages': '拉取飞书群原始消息',
   'fetch_p2p_messages': '读飞书私聊记录',
   'list_joined_chats': '列已加入的群',
   'list_group_members': '列群成员',
@@ -103,13 +106,18 @@ TOOL_TITLES: dict[str, str] = {
 
 @dataclass(frozen=True)
 class _BuiltinGroup:
-  """内置工具组声明。`switch` 为空 = 常开；`entries` 为 (模块, 属性, 是否工厂)。"""
+  """内置工具组声明。`switch` 为空 = 常开；`entries` 为 (模块, 属性, 是否工厂)。
+
+  `defer=True` 表示该组默认不常驻 schema、并入 deferred（用到先 tool_search 加载），
+  页面可见性显示「按需加载」；常驻底座的组保持 False。
+  """
 
   key: str
   label: str
   description: str
   switch: str | None
   entries: tuple[tuple[str, str, bool], ...]
+  defer: bool = False
 
 
 _BUILTIN_GROUPS: tuple[_BuiltinGroup, ...] = (
@@ -135,6 +143,7 @@ _BUILTIN_GROUPS: tuple[_BuiltinGroup, ...] = (
       ('tools.skill_tools', 'skill_manage', False),
       ('tools.skill_tools', 'stage_skill_script', False),
     ),
+    defer=True,
   ),
   _BuiltinGroup(
     'todo', '任务清单', '计划模式下维护任务进度清单（展示在输入框上方）', None,
@@ -149,27 +158,49 @@ _BUILTIN_GROUPS: tuple[_BuiltinGroup, ...] = (
     (('tools.history_tools', 'build_history_tools', True),),
   ),
   _BuiltinGroup(
-    'incident', '事件统计', '从飞书园区群通报生成数据中心事件统计表，以及单个事件的完整进展', None,
+    'incident', '事件统计',
+    '事件统计表 / 单个事件进展 / 应急群消息原文检索（只覆盖应急/事件通报群）',
+    None,
     (
       ('tools.incident_tools', 'incident_report', False),
       ('tools.incident_tools', 'incident_progress', False),
+      ('tools.incident_tools', 'group_message_search', False),
     ),
+    defer=True,
+  ),
+  _BuiltinGroup(
+    'change_notice', '日常变更统计',
+    '按园区群每日变更通知汇总「园区 × 数据中心」的变更类型 / 维护事项 / 执行状态',
+    None,
+    (('tools.change_notice_tools', 'change_notice_report', False),),
+    defer=True,
   ),
   _BuiltinGroup(
     'schedule', '定时任务', '用自然语言创建 / 管理定时执行的 Agent 任务', 'SCHEDULED_TASKS_ENABLED',
     (('tools.schedule_task_tool', 'schedule_task', False),),
+    defer=True,
   ),
   _BuiltinGroup(
     'event_alarm', '事件告警关联', '把事件工单与动环告警按时间 / 设备匹配起来', 'DCIM_ENABLED',
     (('tools.event_alarm_tools', 'event_alarm_link', False),),
+    defer=True,
   ),
   _BuiltinGroup(
     'doc_update', '文档更新检查', '按月核对各部门共享文档是否已更新', 'DOC_UPDATE_CHECK_ENABLED',
     (('tools.doc_update_tools', 'doc_update_check', False),),
+    defer=True,
+  ),
+  _BuiltinGroup(
+    'drill_audit', '应急演练合规审查',
+    '取演练周 4 份班组记录（扫描件）OCR 后，与知识库 EOP 逐项比对，给出合规结论与问题清单',
+    'DRILL_AUDIT_ENABLED',
+    (('tools.drill_audit_tools', 'drill_compliance_audit', False),),
+    defer=True,
   ),
   _BuiltinGroup(
     'video', '讲解视频', '用上传的 PPT 或一段文字生成逐页解说的讲解视频', 'VIDEO_AGENT_ENABLED',
     (('tools.agent_video_tools', 'build_agent_video_tools', True),),
+    defer=True,
   ),
   _BuiltinGroup(
     'feishu', '飞书消息', '读取飞书群消息、私聊记录与群成员', 'LARK_ENABLED',
@@ -179,6 +210,7 @@ _BUILTIN_GROUPS: tuple[_BuiltinGroup, ...] = (
       ('tools.feishu_tools', 'list_joined_chats', False),
       ('tools.feishu_tools', 'list_group_members', False),
     ),
+    defer=True,
   ),
 )
 
@@ -280,7 +312,7 @@ def _load_builtin_group(spec: _BuiltinGroup) -> dict | None:
         'category_label': '',
         'domain_label': '',
         'required_perm': '',
-        'visibility': 'always',
+        'visibility': 'on_demand' if spec.defer else 'always',
         'mode_gated': False,
       })
   if not tools:

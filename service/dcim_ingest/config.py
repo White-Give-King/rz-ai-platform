@@ -136,6 +136,10 @@ def consumer_config(
     'enable.auto.commit': auto_commit,
     'auto.offset.reset': 'earliest',
     'enable.partition.eof': False,
+    # 单批写 TDengine 实测可达 48~139s（宽表首次建大量列），叠加 5 次退避重试会超过
+    # rdkafka 默认的 300s → MAXPOLL「leaving group」→ 提交报 _ASSIGNMENT_LOST。
+    # 放宽到 600s：数据本身不丢（写成功才提交），只是离组判定更慢。
+    'max.poll.interval.ms': 600000,
   }
   if settings.KAFKA_SECURITY_PROTOCOL.upper().startswith('SASL'):
     conf.update({

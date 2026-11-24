@@ -20,15 +20,17 @@ from core.agent.untrusted_content import sanitizing
 logger = logging.getLogger(__name__)
 
 _NOTE = (
-  '覆盖 25 条**月度**文档 × 各公司 A 部门（廊坊 A1…A18、平湖/惠州/佛山/重庆各 2~3 个）'
-  '的共享目录（实时/年度/季度/周等不在本功能范围）；同名部门按公司区分。'
-  '按期提交型（目录里有月份文件夹，如能源月报）只看本期应到月份有没有文件；'
-  '原地更新型（无月份文件夹）按内容哈希与上期比对。'
+  '覆盖 25 条**月度**文档 × 各公司部门（廊坊 A1…A18 + B1M1/B1M2、'
+  '平湖/惠州/佛山/重庆各 2~3 个）的共享目录（实时/年度/季度/周等不在本功能范围）；'
+  '同名部门按公司区分。'
+  '判定口径按清单项固定（`judge`）：标「线上更新」的项查内容是否变化（sha256 与上期比）；'
+  '其余项查本期是否交了新文件（路径里有月份期号就看本期应到月份，否则看有没有上期没有的文件），'
+  '不下载、不比对内容。'
   '「未找到」＝该部门下未查询到相关文件；「下载失败」＝取不到字节或类型校验不过。'
   '两者都**不是**「未更新」。'
 )
 _NOTE_BASELINE = (
-  _NOTE + '原地更新型没有上期快照，本次只建基线；按期提交型已直接判定。'
+  _NOTE + '查更新项没有上期快照，本次只建基线；有月份期号的查新增项已直接判定。'
 )
 _PROGRESS_EVERY = 5
 
@@ -100,12 +102,16 @@ def _payload(verdict: dict, snapshot_taken_at, synced: bool,
         'dept_name': item.get('dept_name') or '',
         'number': item.get('number'),
         'name': item.get('name'),
+        # update=查更新（sha256）/ new=查新增（新文件或本期期号）
+        'judge': item.get('judge') or '',
         'layout': item.get('layout') or '',
         'latest_period': item.get('latest_period') or '',
         'actual_dirs': item.get('actual_dirs') or [],
         'status': item.get('status_label'),
         'file_count': item.get('file_count'),
         'changed_days_ago': item.get('changed_days_ago'),
+        # 带月份线索但没有年份锚的文件：待人工确认，不影响该项状态
+        'pending_files': item.get('pending_files') or [],
         'error': item.get('error') or '',
       }
       for item in verdict.get('items') or []
@@ -134,10 +140,11 @@ async def doc_update_check(sync: bool = False, name: str = '',
                            config: RunnableConfig = None) -> str:
   """逐个公司、逐个部门检查「平台每月所需更新文件目录」里的 25 条月度文档本月是否更新。
 
-  平台对**每家公司的每个 A 部门**（廊坊 A1…A18，平湖/惠州/佛山/重庆各 2~3 个）的
+  平台对**每家公司的每个部门**（廊坊 A1…A18 + B1M1/B1M2，平湖/惠州/佛山/重庆各 2~3 个）的
   共享文档目录分别检查，**不要**自己用 analysis_load 或文件接口复算，也不要用文档里的
-  updateTime/uploadTime 判断（那两个字段不可信）。有月份文件夹的项看本期应到月份有没有
-  文件；无月份文件夹的项按 sha256 与上期快照比对。
+  updateTime/uploadTime 判断（那两个字段不可信）。判定口径按清单项固定：标「线上更新」的项
+  按 sha256 与上期快照比内容是否变化；其余项查本期是否交了新文件（有月份期号看本期应到月份，
+  否则看上期没有的新文件），不下载、不比内容。
 
   返回 `summary` 计数、按部门汇总的 `depts` 与逐项 `items`（带 `company_name`/`dept_name`；
   同名部门用 `company_name` 区分）。
@@ -145,8 +152,8 @@ async def doc_update_check(sync: bool = False, name: str = '',
   没有上期时 `mode='baseline'`（`baseline=true`），只说明"已建立基线"，不要说"未更新"。
 
   Args:
-    sync: 是否**现在**去下载并重算哈希。默认 false = 直接读最近一次快照的比对
-      结果，秒回。只有用户明确说「现在查一下 / 重新检查 / 更新一下」时才传 true。
+    sync: 是否**现在**去遍历目录重算（查更新项还要下载算哈希）。默认 false = 直接读
+      最近一次快照的比对结果，秒回。只有用户明确说「现在查一下 / 重新检查 / 更新一下」时才传 true。
       带 `name` 时只下载匹配到的那几项（约 1~3 秒），不动其余项。
     name: 要看**某一个**文档时传它的**文件名**（如「负载管理统计分析表」
       「供配电程序文档目录」），不要传编号、也不要为了一个文件传 sync 跑整期。
@@ -174,7 +181,7 @@ async def doc_update_check(sync: bool = False, name: str = '',
         'candidates': _catalog_pairs(items),
       }, ensure_ascii=False)
 
-  async def _progress(done: int, total: int, item_name: str) -> None:
+  async def _progress(done: int, total: int, item_name: str, phase: str = '') -> None:
     if done % _PROGRESS_EVERY and done != total:
       return
     try:

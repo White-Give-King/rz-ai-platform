@@ -3,7 +3,7 @@
 1. `<file>` 产物 → 签名下载链接（按 filename 反查会话目录里真实产物，**不信任**标签
    url 里的 dataset_id —— LLM 可能编造）。
 2. records 交互表格 → 读整理后 CSV 前几行转纯文本（IM 里没有前端表格组件）。
-3. `<chart>` / `<mermaid>` → 删除（IM 不渲染，不留占位）。
+3. `<chart>` / `<mermaid>` / ` ```mermaid ` 围栏块 → 删除（IM 不渲染，不留占位）。
 
 各通道传入自己的产物端点前缀与 token 命名空间，其余逻辑完全共用。
 """
@@ -17,6 +17,9 @@ _FILE_URL_RE = re.compile(r'url="([^"]*)"')
 _FILE_NAME_RE = re.compile(r'name="([^"]*)"')
 _CHART_TAG_RE = re.compile(r'<chart\b([^>]*)>.*?</chart>', re.DOTALL)
 _MERMAID_TAG_RE = re.compile(r'<mermaid\b[^>]*>.*?</mermaid>', re.DOTALL)
+_MERMAID_FENCE_RE = re.compile(
+  r'```[ \t]*mermaid\b[^\n]*\n.*?\n[ \t]*```[ \t]*\n?', re.DOTALL,
+)
 _RECORDS_DS_RE = re.compile(r'/agent/artifacts/[^/]+/([^/]+)/records')
 
 _RECORDS_MAX_ROWS = 5
@@ -99,4 +102,5 @@ def rewrite_for_channel(
   text = _FILE_TAG_RE.sub(_fix, text)
   text = _CHART_TAG_RE.sub('', text)
   text = _MERMAID_TAG_RE.sub('', text)
+  text = _MERMAID_FENCE_RE.sub('', text)
   return text

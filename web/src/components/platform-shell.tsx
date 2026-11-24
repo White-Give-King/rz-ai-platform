@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard,
@@ -11,6 +11,7 @@ import {
   BookOpen,
   Clock,
   ShieldCheck,
+  CalendarClock,
   Users,
   User,
   Shield,
@@ -32,8 +33,19 @@ import { useChatStore } from '@/stores/chatStore';
 import { listNotifications } from '@/api/scheduledTasks';
 import { pushInAppNotification } from '@/lib/notifications';
 import { Button } from '@/components/ui/button';
+import { useConfirm } from '@/components/confirm-dialog';
 
 const SIDEBAR_COLLAPSED_KEY = 'sidebar-collapsed';
+
+/** 顶栏插槽：详情看板（portal 到 body）把自己的返回/面包屑/操作 portal 进顶栏。 */
+const ShellHeaderSlotsContext = createContext<{
+  lead: HTMLElement | null;
+  actions: HTMLElement | null;
+}>({ lead: null, actions: null });
+
+export function useShellHeaderSlots() {
+  return useContext(ShellHeaderSlotsContext);
+}
 
 /** 相对时间：刚刚 / X分钟前 / X小时前 / 日期。 */
 function formatRelativeTime(ts: number): string {
@@ -65,12 +77,7 @@ const navGroups: NavGroup[] = [
     items: [
       { href: '/', label: '总览', icon: LayoutDashboard },
       { href: '/innovation', label: '创新空间', icon: Lightbulb },
-    ],
-  },
-  {
-    label: '智能体',
-    items: [
-      { href: '/agent-skills', label: '技能中心', icon: Bot, perm: 'ai:agent' },
+      { href: '/agent-skills', label: '智能体', icon: Bot, perm: 'ai:agent' },
     ],
   },
   {
@@ -80,6 +87,8 @@ const navGroups: NavGroup[] = [
       // 定时任务/分析报告：后端 API 门控是 scheduled_task:manage，前端按同一口径（此前用 ai:agent，会出现"能进页面但接口 403"）
       { href: '/analysis-reports', label: '分析报告', icon: FileText, perm: 'ai:agent' },
       { href: '/compliance', label: '合规检查', icon: ShieldCheck, perm: 'ai:agent' },
+      // 日常运维：卡片落地页（变更统计 / 事件统计），数据来自飞书园区群消息
+      { href: '/ops', label: '日常运维', icon: CalendarClock, perm: 'ai:agent' },
       { href: '/scheduled-tasks', label: '定时任务', icon: Clock, perm: 'scheduled_task:manage' },
       // 名字保持「视频生成」（表单页：批量提交/看历史）；输入栏那个同名开关是"本轮对话里做视频"
       { href: '/video', label: '视频生成', icon: Clapperboard, perm: 'ai:video' },
@@ -124,6 +133,7 @@ export function PlatformShell({
   const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
   const clearAuth = useAuthStore((s) => s.clearAuth);
+  const confirm = useConfirm();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true',
@@ -135,6 +145,12 @@ export function PlatformShell({
   const notifMarkAllRead = useNotificationStore((s) => s.markAllRead);
   const notifClear = useNotificationStore((s) => s.clear);
   const jumpToAnswer = useChatStore((s) => s.jumpToAnswer);
+  const [leadSlot, setLeadSlot] = useState<HTMLElement | null>(null);
+  const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null);
+  const slotsValue = useMemo(
+    () => ({ lead: leadSlot, actions: actionsSlot }),
+    [leadSlot, actionsSlot],
+  );
 
   // 点击通知：带通用跳转路径时直接跳转；否则带会话目标时切到「对话助手」页并定位对应回答；无目标仅收起
   const handleOpenNotification = (n: AppNotification) => {
@@ -214,6 +230,13 @@ export function PlatformShell({
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(next));
   };
 
+  // 详情看板 portal 到 body，继承不到这里的宽度；写到根元素供 .rz-board-overlay 定位
+  useEffect(() => {
+    const root = document.documentElement;
+    root.style.setProperty('--rz-sidebar-w', collapsed ? '4rem' : '16rem');
+    return () => { root.style.removeProperty('--rz-sidebar-w'); };
+  }, [collapsed]);
+
   const hasPermission = useAuthStore((s) => s.hasPermission);
 
   const filteredGroups = navGroups
@@ -237,12 +260,49 @@ export function PlatformShell({
           collapsed && 'lg:w-16',
         )}
       >
-        <div className={cn('flex h-14 items-center gap-2.5 border-b border-sidebar-border px-5', collapsed && 'lg:justify-center lg:px-0')}>
-          <img src="/logo.png" alt="润泽科技" className="size-10 shrink-0 rounded-lg" />
+        <div className={cn(
+          'group/sidebar-head relative flex h-14 items-center gap-2.5 border-b border-sidebar-border px-5',
+          collapsed && 'lg:justify-center lg:px-0',
+        )}>
+          <img
+            src="/logo.png"
+            alt="润泽科技"
+            className={cn(
+              'size-10 shrink-0 rounded-lg',
+              collapsed && 'lg:group-hover/sidebar-head:hidden lg:group-focus-within/sidebar-head:hidden',
+            )}
+          />
           <div className={cn('flex flex-col leading-none', collapsed && 'lg:hidden')}>
             <span className="whitespace-nowrap text-sm font-semibold text-sidebar-foreground">智能运维平台</span>
             <span className="mt-0.5 whitespace-nowrap text-xs text-muted-foreground">润泽 AI 能力中心</span>
           </div>
+
+          {/* 展开态：头部右侧常显「收起」；移动端抽屉不显示 */}
+          <button
+            onClick={toggleCollapsed}
+            title="收起侧边栏"
+            aria-label="收起侧边栏"
+            className={cn(
+              'ml-auto hidden rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-sidebar-foreground lg:block',
+              collapsed && 'lg:hidden',
+            )}
+          >
+            <PanelLeftClose className="size-4" />
+          </button>
+
+          {/* 收起态：悬停/键盘聚焦头部时淡入，铺满头部即点击展开 */}
+          {collapsed && (
+            <button
+              onClick={toggleCollapsed}
+              title="展开侧边栏"
+              aria-label="展开侧边栏"
+              className="absolute inset-0 hidden items-center justify-center text-muted-foreground transition-opacity hover:text-sidebar-foreground lg:flex lg:opacity-0 lg:group-hover/sidebar-head:opacity-100 lg:focus-visible:opacity-100"
+            >
+              <PanelLeftOpen className="size-5" />
+            </button>
+          )}
+
+          {/* 移动端关闭抽屉：原样保留 */}
           <button
             onClick={() => setMobileOpen(false)}
             className="ml-auto rounded-md p-1 text-muted-foreground hover:bg-accent lg:hidden"
@@ -309,9 +369,11 @@ export function PlatformShell({
               variant="ghost"
               size="icon-sm"
               onClick={() => {
-                if (window.confirm('确定退出登录吗？')) {
-                  clearAuth();
-                }
+                void confirm({
+                  title: '退出登录',
+                  description: '确定退出登录吗？',
+                  confirmText: '退出登录',
+                }).then((ok) => { if (ok) clearAuth(); });
               }}
               data-tip="退出登录"
               className={collapsed ? 'lg:hidden' : undefined}
@@ -331,7 +393,7 @@ export function PlatformShell({
 
       {/* Main */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-30 flex h-14 items-center gap-4 border-b border-border bg-background/80 px-4 backdrop-blur-md lg:px-8">
+        <header className="sticky top-0 z-30 flex h-14 items-center gap-4 border-b border-border bg-background px-4 lg:px-8">
           <button
             onClick={() => setMobileOpen(true)}
             className="rounded-md p-1.5 text-muted-foreground hover:bg-accent lg:hidden"
@@ -339,17 +401,14 @@ export function PlatformShell({
           >
             <Menu className="size-5" />
           </button>
-          <button
-            onClick={toggleCollapsed}
-            className="hidden rounded-md p-1.5 text-muted-foreground hover:bg-accent lg:block"
-            aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'}
-          >
-            {collapsed ? <PanelLeftOpen className="size-5" /> : <PanelLeftClose className="size-5" />}
-          </button>
-
           {headerActionsLeft}
 
+          {/* 详情看板把返回 + 面包屑 portal 到这里（顶栏即目录层级，不再另起一条头部条） */}
+          <div ref={setLeadSlot} className="flex min-w-0 flex-1 items-center gap-1" />
+
           <div className="ml-auto flex items-center gap-2">
+            {/* 看板操作（下载 Excel / 立即检查）portal 到这里 */}
+            <div ref={setActionsSlot} className="flex items-center gap-2" />
             {headerActions}
             <div className="relative" ref={notifRef}>
               <button
@@ -447,7 +506,9 @@ export function PlatformShell({
                 {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
               </div>
             )}
-            {children}
+            <ShellHeaderSlotsContext.Provider value={slotsValue}>
+              {children}
+            </ShellHeaderSlotsContext.Provider>
           </div>
         </main>
       </div>

@@ -55,6 +55,40 @@ def load_reports(start_s: int, end_s: int, cluster_prefix: str | None = None,
     repo.close()
 
 
+# 消息检索用的 SQL 常量（便于自检断言「不带 kind 过滤」；`load_reports` 一条都不动）
+_MESSAGES_SQL = (
+  'SELECT id, chat_id, message_id, cluster, kind, title, create_time, event_time,'
+  '       text, sender, sender_id, sender_id_type'
+  '  FROM dcim_incident_reports'
+  ' WHERE create_time >= %s AND create_time < %s'
+)
+
+
+def load_messages(start_s: int, end_s: int, cluster_prefix: str | None = None,
+                  chat_ids: list[str] | None = None) -> list[dict]:
+  """窗口内**全部**入库消息（含 `kind='other'`），按消息时间升序。
+
+  与 `load_reports` 唯一的差别是不带 `kind IN ('sos','first')`：实时入库把群里可提取文本
+  的消息全写进本表，而事件统计链路只认速报/首报，普通消息此前没有查询入口。
+  """
+  sql = _MESSAGES_SQL
+  args: list = [start_s, end_s]
+  if cluster_prefix:
+    sql += ' AND cluster LIKE %s'
+    args.append(f'{cluster_prefix}%')
+  if chat_ids:
+    sql += ' AND chat_id = ANY(%s)'
+    args.append(list(chat_ids))
+  sql += ' ORDER BY create_time'
+  repo = _repo()
+  try:
+    with repo.conn.cursor() as cur:
+      cur.execute(sql, args)
+      return list(cur.fetchall())
+  finally:
+    repo.close()
+
+
 # `alarm_time` 是当前态，会被刷新(2)/恢复(3)推送覆盖（`parse_alarm` 每条推送都写它 +
 # `apply_batch` 整行 upsert），不能当触发时刻展示或归属统计期。`trigger_time` 取历史表
 # 第一条 `status='1'` 推送的 `timestamp`（append-only，不变）；没有历史的老告警回退

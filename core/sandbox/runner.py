@@ -22,6 +22,7 @@ import time
 import sys
 from pathlib import Path
 
+from core.sandbox.excel_style import RZ_EXCEL_SRC
 from core.sandbox.report_style import RZ_MPL_SRC
 
 logger = logging.getLogger(__name__)
@@ -294,6 +295,11 @@ def render_pdf(html_path, pdf_path, css=None):
 # 源码唯一定义在 core/sandbox/report_style.py，由 _build_wrapper() 注入。
 __RZ_STYLE__
 
+# 3.8 Excel 样式助手（定义 rz_excel：写带色 xlsx，按单元格颜色词自动填底色）。
+# 同样只是**定义**、不 import openpyxl —— 不产 Excel 的脚本一分钱不付。
+# 源码唯一定义在 core/sandbox/excel_style.py，由 _build_wrapper() 注入。
+__RZ_EXCEL__
+
 # 4. 用户代码
 __USER_CODE__
 
@@ -339,6 +345,7 @@ def _build_wrapper(code: str, *, timeout: int, max_memory_mb: int) -> str:
     .replace('__MAX_MEMORY_MB__', str(max_memory_mb))
     .replace('__TIMEOUT__', str(timeout))
     .replace('__RZ_STYLE__', RZ_MPL_SRC)
+    .replace('__RZ_EXCEL__', RZ_EXCEL_SRC)
     .replace('__USER_CODE__', code)
   )
 

@@ -72,6 +72,18 @@ _DT_MD = re.compile(
 # 一旦当机房信号参与匹配就会误命中 `M1-301` 之类的空间名。
 _ROOM_RE = re.compile(r'(?<![A-Za-z0-9])[A-Za-z]{1,3}\d{1,3}-\d{1,4}(?![A-Za-z0-9])')
 
+# 日常运维群（廊坊/平湖AB/佛山/惠州/重庆/巴淡）里人发的变更通知头，四种形态：
+#   廊坊 `【变更开始-通知】` / `【变更完成-通知】`
+#   平湖 `【ET15机房Y楼-维护通告】开启` / `【…变更通告】-开启`（编号列表，正文第 8 项常写「通报：…」）
+#   佛山/重庆 `【变更开始-<标题>】` / `【变更结束|完成-<标题>】`（重庆可能被 `<p>` 包裹）
+#   惠州 `【维修变更开始】` / `【维修变更完成】`
+# 必须**先**判它：变更通知里常带「通报」，否则会被 classify 判成 first、挤占告警匹配队列。
+# 用括号形态作强信号，不按行首锚定（卡片/富文本会有 `<p>` 前缀）。
+_CHANGE_HEADER_RE = re.compile(
+  r'[\[【][^\]】]{0,30}(?:维护通告|变更通告)[\]】]'
+  r'|[\[【]\s*(?:维修)?变更\s*(?:开始|结束|完成)'
+)
+
 
 def _client():
   if not settings.LARK_APP_ID or not settings.LARK_APP_SECRET:
@@ -118,6 +130,22 @@ def _labeled(text: str, aliases: tuple[str, ...], limit: int = 200) -> str:
   return value.strip()
 
 
+def _bare_labeled(text: str, aliases: tuple[str, ...], limit: int = 200) -> str:
+  """裸标签**独占一行**、值在下一行的写法：`发生时间\\n2026年11月13日13时41分33秒`。
+
+  某些 eWatch 变体的形态（无【】、无冒号），`_labeled` 的两种写法都匹配不上。
+  **只给 `parse_event_time` 用**，不要并进 `_labeled`：后者还被「事件概述/告警值/
+  地点」共用，而 `【\\n事件概述\\n】` 这类括号换行写法会让裸标签先命中、值取到 `]`。
+  """
+  normalized = _norm(text or '')
+  pattern = (r'(?m)^[ \t]*(?:' + '|'.join(map(re.escape, aliases))
+             + r')[ \t]*:?[ \t]*\r?\n')
+  hit = re.search(pattern, normalized)
+  if not hit:
+    return ''
+  return normalized[hit.end():].split('\n', 1)[0].strip()[:limit]
+
+
 def _ref_dt(ref_ts: int | None) -> datetime:
   if ref_ts is None:
     return datetime.now(tz=_TZ)
@@ -125,12 +153,21 @@ def _ref_dt(ref_ts: int | None) -> datetime:
 
 
 def _walk_texts(node, out: list[str]) -> None:
-  """递归抽卡片 JSON 里的可读文本（text/content/title/fields）。"""
+  """递归抽卡片 JSON 里的可读文本（text/content/title/fields）。
+
+  **去重只在本节点内做**：同一节点可能同时有 text 与 content（同一段文本被收两次），
+  但跨节点绝不去重 —— 拆元素卡片的 `【` / `标签` / `】 ` 各自是一个节点，
+  全局保序去重会把第二处起的 `【`/`】` 当重复丢掉，标签退化成裸行（见 2026-11-13 佛山）。
+  """
   if isinstance(node, dict):
+    seen: set[str] = set()
     for key in ('text', 'content', 'title'):
       value = node.get(key)
       if isinstance(value, str) and value.strip():
-        out.append(value.strip())
+        text = value.strip()
+        if text not in seen:
+          seen.add(text)
+          out.append(text)
     for value in node.values():
       if isinstance(value, (dict, list)):
         _walk_texts(value, out)
@@ -158,8 +195,8 @@ def extract_text(message) -> str:
     return content_str
   parts: list[str] = []
   _walk_texts(content, parts)
-  # 卡片里的同一段文本会被 text/content 各收一次 → 保序去重
-  return '\n'.join(dict.fromkeys(parts))
+  # 去重已在 _walk_texts 的**节点内**完成；这里不能再全局去重（会吃掉重复的【/】）
+  return '\n'.join(parts)
 
 
 def text_from_content(msg_type: str, content_str: str) -> str:
@@ -178,8 +215,8 @@ def text_from_content(msg_type: str, content_str: str) -> str:
   if msg_type == 'interactive':
     parts: list[str] = []
     _walk_texts(content, parts)
-    # 卡片里的同一段文本会被 text/content 各收一次 → 保序去重
-    return '\n'.join(dict.fromkeys(parts))
+    # 同 extract_text：去重只在 _walk_texts 节点内做，出口不能再全局去重
+    return '\n'.join(parts)
   from service.feishu.channel import _extract_text
 
   return _extract_text(content)
@@ -193,9 +230,9 @@ def build_report_row(*, chat_id: str, message_id: str, create_s: int, sender: st
   共用是为了两路产出的行完全同形：字段名/派生规则（kind/event_time/title/
   report_value/room_code）只要有一处分叉，同一窗口按两种方式进库就会分裂。
   """
-  kind = classify(text)
+  kind = classify(text, chat_id)
   event_time = extract_event_time(text, create_s)
-  if kind != 'other' and event_time is None:
+  if kind in ('sos', 'first') and event_time is None:
     logger.warning('[Incident] 通报未解析到发生时间 chat=%s msg=%s', chat_id, message_id)
   return {
     'chat_id': chat_id,
@@ -222,14 +259,23 @@ def is_ewatch(text: str) -> bool:
   return bool(_EWATCH_RE.search(text or ''))
 
 
-def classify(text: str) -> str:
-  """正文 → sos(速报) | first(首报/通报) | other。
+def classify(text: str, chat_id: str = '') -> str:
+  """正文 → change(变更通知) | sos(速报) | first(首报/通报) | other。
 
-  纯关键字字面匹配：含「速报」→ 速报；含「通报/首报」→ 事件表里的首报；华为 eWatch
+  **群身份优先**：日常运维群（`CHANGE_NOTICE_FEISHU_PARK_CHATS`）里只可能是
+  change / other，绝不产出 sos/first —— 这些群不参与告警匹配，正文带「通报」
+  不是首报（2026-11 实测约 22% 变更报文被判成 first，挤占匹配队列）。
+  其余群走纯关键字字面匹配：命中变更通知头（`_CHANGE_HEADER_RE`）→ change，
+  **最先判**——平湖的维护通告正文第 8 项常写「通报：…」，不先判 change 会被算成
+  first；含「速报」→ 速报；含「通报/首报」→ 事件表里的首报；华为 eWatch
   **告警产生**（`<告警产生>`）是速报的另一种格式，同样算速报（`<告警恢复>` 不算）。
   速报优先于通报 —— 速报正文常写「已通报二线」，先判通报会把速报算成首报。
   """
   text = text or ''
+  if chat_id and is_change_chat(chat_id):
+    return 'change' if _CHANGE_HEADER_RE.search(text) else 'other'
+  if _CHANGE_HEADER_RE.search(text):
+    return 'change'
   if '速报' in text:
     return 'sos'
   if '通报' in text or '首报' in text:
@@ -250,7 +296,7 @@ def parse_event_time(text: str, ref_ts: int | None = None) -> int | None:
   - 无年份 → 用消息时间（`ref_ts`）的年份；比消息晚 180 天以上 → 年份 −1
   - **只有日期没有时分 → None**（不用 00:00 硬凑，避免匹配偏到凌晨）
   """
-  value = _labeled(text, _TIME_LABELS)
+  value = _labeled(text, _TIME_LABELS) or _bare_labeled(text, _TIME_LABELS)
   if not value and is_ewatch(text):
     hit = _EWATCH_TIME_RE.search(_norm(text or ''))
     value = hit.group(1).strip() if hit else ''
@@ -405,6 +451,57 @@ async def resolve_park_chats() -> dict[str, str]:
     else:
       logger.warning('[Incident] 未找到园区群 park=%s 群名=%s（机器人是否已进群？）', park, value)
   return out
+
+
+# 日常运维群（变更统计）配置的进程内 memo：按**原始字符串**判断是否重算，
+# 测试里改 settings 后自动生效，不必手动清缓存。
+_change_chat_memo: tuple[str, frozenset[str]] = ('', frozenset())
+
+
+def change_park_chats(parks: list[str] | None = None) -> dict[str, str]:
+  """`CHANGE_NOTICE_FEISHU_PARK_CHATS` → {园区: chat_id}，只解析配置、不查飞书。
+
+  解析失败一律返回空字典（同 `change_notice.config` 的「未配置」语义）。
+  """
+  raw = (getattr(settings, 'CHANGE_NOTICE_FEISHU_PARK_CHATS', '') or '').strip()
+  if not raw:
+    return {}
+  try:
+    parsed = json.loads(raw)
+  except (ValueError, TypeError):
+    logger.warning('[Incident] CHANGE_NOTICE_FEISHU_PARK_CHATS 不是合法 JSON，跳过')
+    return {}
+  if not isinstance(parsed, dict):
+    return {}
+  mapping = {str(k).strip(): str(v).strip() for k, v in parsed.items() if k and v}
+  if parks:
+    wanted = {p.strip() for p in parks if p and p.strip()}
+    mapping = {k: v for k, v in mapping.items() if k in wanted}
+  return mapping
+
+
+def _change_chat_ids() -> frozenset[str]:
+  """日常运维群 chat_id 集合（进程内 memo，配置原文变化才重算）。"""
+  global _change_chat_memo
+  raw = (getattr(settings, 'CHANGE_NOTICE_FEISHU_PARK_CHATS', '') or '').strip()
+  cached_raw, cached = _change_chat_memo
+  if raw == cached_raw:
+    return cached
+  ids = frozenset(change_park_chats().values())
+  _change_chat_memo = (raw, ids)
+  return ids
+
+
+def _incident_chat_ids() -> frozenset[str]:
+  """应急群 chat_id 集合（只取配置里 `oc_` 形态的值；群名形态由 realtime 异步解析兜底）。"""
+  return frozenset(v for v in _park_config().values() if v.startswith('oc_'))
+
+
+def is_change_chat(chat_id: str) -> bool:
+  """是否日常运维群（应急群优先：两边都配置了同一个 id 时按应急处理）。"""
+  chat_id = (chat_id or '').strip()
+  return (bool(chat_id) and chat_id in _change_chat_ids()
+          and chat_id not in _incident_chat_ids())
 
 
 _RECALLED_PLACEHOLDER = 'This message was recalled'

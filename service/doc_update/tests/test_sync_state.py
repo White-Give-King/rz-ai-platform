@@ -1,4 +1,4 @@
-"""同步租约自检（纯 assert、不连 Redis）：互斥、进度、释放、token 防误删、旧值容错。
+"""同步租约自检（纯 assert、不连 Redis）：互斥、进度、释放、token 防误删、旧值容错、终止。
 
 跑法：`python -m service.doc_update.tests.test_sync_state`
 """
@@ -9,7 +9,7 @@ from service.doc_update import sync_state
 
 
 class FakeClient:
-  """只实现 `set/get/eval` 三件套；eval 按脚本里是否有 DEL 区分续期与释放。"""
+  """只实现 `set/get/delete/eval`；eval 按脚本里是否有 DEL 区分续期与释放。"""
 
   def __init__(self):
     self.data: dict[str, str] = {}
@@ -27,6 +27,9 @@ class FakeClient:
 
   def get(self, key):
     return self.data.get(key)
+
+  def delete(self, key):
+    self.data.pop(key, None)
 
   def eval(self, script, numkeys, key, token, *args):
     raw = self.data.get(key)
@@ -79,10 +82,11 @@ def test_release_frees_lock():
 def test_update_writes_progress():
   fake = _fake()
   lease = sync_state.acquire('manual', 'u1')
-  lease.update(3, 300, 'A7 · 1.4.5 能源管理报告')
+  lease.update(3, 300, 'A7 · 1.4.5 能源管理报告', 'items')
   info = sync_state.read()
   assert (info['done'], info['total']) == (3, 300)
   assert info['current'] == 'A7 · 1.4.5 能源管理报告'
+  assert info['phase'] == 'items'
   assert info['started_at'] and info['started_at'] > 0
   _, payload, _, ex = fake.client.calls[0]
   assert ex == sync_state.LEASE_TTL
@@ -106,6 +110,7 @@ def test_legacy_value_is_tolerated():
   info = sync_state.read()
   assert info['mode'] == 'legacy' and info['user_id'] == 'u123'
   assert info['done'] == 0 and info['total'] == 0
+  assert info['phase'] == ''
 
 
 def test_redis_down_fails_open():
@@ -115,6 +120,60 @@ def test_redis_down_fails_open():
   assert lease is not None, 'Redis 不可用应与旧行为一致（不上锁继续）'
   assert sync_state.read() is None
   lease.release()
+
+
+def test_cancel_marks_cancelling():
+  fake = _fake()
+  lease = sync_state.acquire('manual', 'u1')
+  assert sync_state.read()['cancelling'] is False
+  assert sync_state.request_cancel() is True
+  assert sync_state.read()['cancelling'] is True
+  assert fake.client.data['rz:doc_update:cancel'] == lease.token
+  lease.release()
+
+
+def test_cancel_raises_sync_cancelled():
+  _fake()
+  lease = sync_state.acquire('manual', 'u1')
+  sync_state.request_cancel()
+  try:
+    lease.update(1, 50, 'A1 · 1.2.2 运维报告', 'items')
+  except sync_state.SyncCancelled:
+    pass
+  else:
+    raise AssertionError('取消旗标命中后 update() 必须抛 SyncCancelled')
+  assert lease.cancelled is True
+  lease.release()
+
+
+def test_old_cancel_does_not_kill_new_lease():
+  fake = _fake()
+  old = sync_state.acquire('manual', 'u1')
+  sync_state.request_cancel()
+  old.release()   # release 会清掉自己的旗标
+  new = sync_state.acquire('manual', 'u2')
+  # 模拟旧旗标仍残留且指向旧 token
+  fake.client.data['rz:doc_update:cancel'] = old.token
+  new.update(1, 50, '', 'items')  # 不抛 → 新租约不被误杀
+  assert new.cancelled is False
+  assert sync_state.read()['cancelling'] is False
+  new.release()
+
+
+def test_cancel_without_lease_returns_false():
+  _fake()
+  assert sync_state.request_cancel() is False
+  assert sync_state.read() is None
+
+
+def test_release_clears_cancel_flag():
+  fake = _fake()
+  lease = sync_state.acquire('manual', 'u1')
+  sync_state.request_cancel()
+  assert 'rz:doc_update:cancel' in fake.client.data
+  lease.release()
+  assert 'rz:doc_update:cancel' not in fake.client.data, 'release 必须清掉自己的取消旗标'
+  assert 'rz:doc_update:sync' not in fake.client.data
 
 
 def main() -> int:

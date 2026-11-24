@@ -92,6 +92,7 @@ _CATEGORY_LABELS = {
   'config': '配置',
   'skill': '技能',
   'review': '评审',
+  'drill': '演练',
   'dashboard': '看板',
   'page': '页面操作',
 }
@@ -118,6 +119,7 @@ _DOMAIN_LABELS = {
   'config': '配置',
   'skill': '技能',
   'review': '评审',
+  'drill': '演练',
   'dashboard': '看板',
   'capture': '页面捕获',
   'explore': '交互浏览',
@@ -191,6 +193,43 @@ _MANIFEST_ANCHOR = (
   '本清单只列**已注册**的能力，是「你能做什么」的**权威来源**：被问「你能查什么 / 能做什么」时'
   '以本清单与你的工具 schema 为准，不要凭记忆列举（历史版本里写死的能力清单可能已下线）。'
 )
+
+# 内置工具的扩展桶（默认走 deferred，用得着先 tool_search）：桶标签 → 工具名。
+# 只列**实际注册**的桶（开关关掉的桶自然为空），顺序即 `<available-tools>` 里的展示序。
+_BUILTIN_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+  ('讲解视频', (
+    'video_create', 'video_create_from_text', 'video_status', 'video_pages',
+    'video_update_page', 'video_update_pages', 'video_set_options', 'video_rerender',
+  )),
+  ('飞书消息', (
+    'fetch_group_messages', 'fetch_p2p_messages', 'list_joined_chats', 'list_group_members',
+  )),
+  ('事件统计 / 应急群消息检索', ('incident_report', 'incident_progress', 'group_message_search')),
+  ('日常变更统计', ('change_notice_report',)),
+  ('事件告警关联', ('event_alarm_link',)),
+  ('演练合规审查', ('drill_compliance_audit',)),
+  ('文档更新检查', ('doc_update_check',)),
+  ('定时任务', ('schedule_task',)),
+  ('技能管理', ('skill_manage', 'stage_skill_script')),
+)
+
+
+def build_deferred_builtin_hint(names) -> str:
+  """生成「扩展能力」提示段：告诉模型哪些内置工具也在 tool_search 目录里。
+
+  这些工具默认不常驻 schema（并入 deferred，与平台工具同一套机制），但模型得先知道
+  「有这么一类能力、该去搜」才会调 tool_search。`names` 是当前 catalog 里的工具名
+  集合；只列实际注册的桶，一个都没有时返回空串。
+  """
+  present = set(names or ())
+  labels = [label for label, tools in _BUILTIN_BUCKETS if present.intersection(tools)]
+  if not labels:
+    return ''
+  return (
+    '\n\n<extension-tools>\n'
+    '扩展能力（默认未加载，用到先 tool_search）：' + ' / '.join(labels) + '\n'
+    '</extension-tools>'
+  )
 
 
 def build_category_manifest() -> str:

@@ -11,9 +11,11 @@
   留空表示不按名称再过滤。
 - `folders`：真实共享树里见到的目录/文件名（带前导编号，按实测登记）。PDF 里的清单名只是
   模糊叫法，**实际名称优先匹配**，`numbers` 作兜底。发现新写法只改这张表，不动匹配逻辑。
-- `note`：PDF 的第三列（线上更新 / PDF / PPT / 文档），只作展示，不参与判定。
+- `note`：PDF 的第三列（线上更新 / PDF / PPT / 文档），**决定判定口径**（见 `judge`）。
 - `period_only`：只按期判定、**不下载不哈希**；期号允许从文件名解析（能源月报各部门
-  把期号写在文件名里，目录只到年份）。
+  把期号写在文件名里，目录只到年份；`4.1.5` 四条同理，目录只到年份、月份写在文件名里）。
+- `exclude_paths`：**已作废的路径**（连续目录段），这些路径下的文件一律不匹配、不建索引根。
+  用户明确废弃某个旧目录时登记在这里，不要靠删 `folders` 别名（别名在别处仍有效）。
 """
 
 import re
@@ -21,6 +23,12 @@ from dataclasses import dataclass
 
 CADENCE_MONTHLY = '月度'
 IN_SCOPE_CADENCES: tuple[str, ...] = (CADENCE_MONTHLY,)
+
+# 判定口径（一类文档一个口径，与所在部门的目录形态无关）：
+# `线上更新` → 查更新（下载算 sha256，与上一期比内容是否变化）；
+# 其余（PDF / PPT / 文档）→ 查新增（本月有没有新文件 / 本期期号是否已交）。
+JUDGE_UPDATE = 'update'
+JUDGE_NEW = 'new'
 
 
 @dataclass(frozen=True)
@@ -33,14 +41,46 @@ class DocItem:
   keywords: tuple[str, ...] = ()
   folders: tuple[str, ...] = ()
   period_only: bool = False
+  exclude_paths: tuple[tuple[str, ...], ...] = ()
 
   @property
   def in_scope(self) -> bool:
     return self.cadence in IN_SCOPE_CADENCES
 
   @property
+  def judge(self) -> str:
+    """**基准口径**由 PDF 第三列决定：线上更新=查更新，其余=查新增。
+
+    线上更新项若某部门实际是「按月新交」（路径有月份目录，或文件名能解析出
+    多个月份），抓取阶段会按该部门的实际形态自动改判为查新增（见
+    `period.auto_flip`），快照里存的是改判后的口径。
+    """
+    return JUDGE_UPDATE if self.note.strip() == '线上更新' else JUDGE_NEW
+
+  @property
   def number_label(self) -> str:
     return '-'.join(self.numbers)
+
+
+def _path_key(text) -> str:
+  """目录名归一：去所有空白（含全角）+ 转小写。"""
+  return ''.join(str(text or '').replace('\u3000', ' ').split()).lower()
+
+
+def excluded_segments(item: DocItem, segments) -> bool:
+  """`segments` 里是否出现该清单项登记的作废路径（连续段、忽略空白与大小写）。"""
+  paths = item.exclude_paths or ()
+  if not paths or not segments:
+    return False
+  names = [_path_key(s) for s in segments]
+  for path in paths:
+    key = [_path_key(p) for p in path]
+    if not key or len(key) > len(names):
+      continue
+    for i in range(len(names) - len(key) + 1):
+      if names[i:i + len(key)] == key:
+        return True
+  return False
 
 
 CATALOG: tuple[DocItem, ...] = (
@@ -49,10 +89,14 @@ CATALOG: tuple[DocItem, ...] = (
   # 后三条是通用写法，覆盖各部门「能源月报/能源报告」主题命名差异
   # 各部门形态不同：只有少数用 `2026年/10月` 目录，多数目录只到年份、期号在文件名里
   # （`…-2026-10.pdf`、`【20261031】`、`10、2026年…10月…`），故只看本期新增、不下载
+  # 作废路径：`二线文件/2.客户报表/供配电/能源月报` 已停更（最新只到 2026-05），
+  # 现在在用且最新的是 `1.4.5能源管理报告（能源月报同步）`；所有部门都排除该路径
   DocItem(2, ('1.4.5',), '能源月报', '月度', 'PPT', ('能源',), (
     '1.4.5能源管理报告', '1.2.3容量管理报告', '8.1.2.3能源管理月报',
     '能源管理报告', '能源月报', '能源报告',
-  ), period_only=True),
+  ), period_only=True, exclude_paths=(
+    ('二线文件', '2.客户报表', '供配电', '能源月报'),
+  )),
   DocItem(3, ('1.6.3.2',), '高低压配电柜继保整定表', '月度', '线上更新'),
   DocItem(4, ('1.6.3.3',), '动环报警阈值管理表', '月度', '线上更新'),
   DocItem(5, ('1.6.4',), '验证测试管理', '实时', '新项目相关测试文件需上传'),
@@ -78,15 +122,27 @@ CATALOG: tuple[DocItem, ...] = (
   DocItem(21, ('2.3.4.4',), '门禁巡检报警记录表', '月度', 'PDF'),
   DocItem(22, ('2.3.4.6',), '值班巡检记录表（部长 工程师 班长）', '月度', 'PDF'),
   DocItem(23, ('2.8.4',), '物品使用登记表（中控室）', '月度', 'PDF'),
-  DocItem(24, ('2.10.5',), '卫生清洁记录表（保洁、技术员）', '月度', 'PDF'),
+  # 实测：廊坊 A1 的月度记录在无编号目录 `卫生清洁记录2026/<月>`（另有平铺旧目录
+  # `卫生清洁记录`），只按编号 2.10.5 会命中章节目录里的模板 xlsx
+  DocItem(24, ('2.10.5',), '卫生清洁记录表（保洁、技术员）', '月度', 'PDF', (), (
+    '卫生清洁记录',
+  )),
   DocItem(25, ('3.8.5',), '应急卡使用核查记录表', '周', '文档'),
   DocItem(26, ('3.8.6',), '门禁权限核查记录表', '季度', '文档'),
-  DocItem(27, ('3.8.7',), '货物运输通道使用记录单', '月度', 'PDF'),
+  # A1 的真实记录在 `3.8门禁权限管理/2026年/货物运输通道使用记录单/<月>`，
+  # 编号 3.8.7 只命中钉点根上的模板 docx
+  DocItem(27, ('3.8.7',), '货物运输通道使用记录单', '月度', 'PDF', (), (
+    '货物运输通道使用记录单',
+  )),
   DocItem(28, ('4.1.6.5',), '电伴热安全检查表', '月度', 'PDF'),
-  DocItem(29, ('4.1.5',), '供配电隐患排查表', '月度', 'PDF', ('供配电',)),
-  DocItem(30, ('4.1.5',), '制冷隐患排查表', '月度', 'PDF', ('制冷',)),
-  DocItem(31, ('4.1.5',), '智能化隐患排查表', '月度', 'PDF', ('智能化',)),
-  DocItem(32, ('4.1.5',), '班组级隐患排查记录表', '月度', 'PDF', ('班组',)),
+  DocItem(29, ('4.1.5',), '供配电隐患排查表', '月度', 'PDF', ('供配电',),
+          period_only=True),
+  DocItem(30, ('4.1.5',), '制冷隐患排查表', '月度', 'PDF', ('制冷',),
+          period_only=True),
+  DocItem(31, ('4.1.5',), '智能化隐患排查表', '月度', 'PDF', ('智能化',),
+          period_only=True),
+  DocItem(32, ('4.1.5',), '班组级隐患排查记录表', '月度', 'PDF', ('班组',),
+          period_only=True),
   DocItem(33, ('4.1.6',), '梯子季度专项安全检查表', '年度', 'PDF', ('梯子',)),
   DocItem(34, ('6.3.1',), '人员排班计划表', '月度', '线上更新'),
   DocItem(35, ('6.3.2',), '考勤统计表', '月度', '线上更新'),

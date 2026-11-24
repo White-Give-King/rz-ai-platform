@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any, Optional
 
 from langchain_core.tools import StructuredTool
-from pydantic import ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from config.settings import settings
 from core.agent.history_archive import store_source
@@ -66,6 +66,27 @@ def tool_name_to_capability(tool_name: str) -> str:
   return tool_name.replace(_NAME_SEP, '.')
 
 
+class _ArgsModel(BaseModel):
+  """生成的参数模型基类。
+
+  `extra='allow'` 让**未声明参数**能进 `**kwargs`（供 `_run` 显式报错，而不是像默认的
+  `extra='ignore'` 那样被静默丢弃 —— 静默丢参会把「传错参数名」变成「按无参数全表扫」）。
+  不能改用 `extra='forbid'`：`create_agent` 的 ToolNode 只吞 `ToolInvocationError`，
+  `ValidationError` 会直接上抛、掐断整轮流。
+
+  `model_json_schema` 覆写去掉 `additionalProperties`：发给模型的 schema 与旧版**逐字一致**，
+  不暗示「可以随便传」，也不增加 token。
+  """
+
+  model_config = ConfigDict(use_enum_values=True, extra='allow')
+
+  @classmethod
+  def model_json_schema(cls, *args, **kwargs):
+    schema = super().model_json_schema(*args, **kwargs)
+    schema.pop('additionalProperties', None)
+    return schema
+
+
 def _build_args_schema(cap: Capability):
   """按 Capability.params 生成 pydantic 模型作为 args_schema。
 
@@ -77,6 +98,8 @@ def _build_args_schema(cap: Capability):
 
   ⚠️ `use_enum_values=True` 是必须的：否则校验后传给工具的是 **Enum 成员对象**，
   下游 `json.dumps(params)` 与各平台 caller 都会拿到不可序列化的东西。
+
+  未声明参数的处理见 `_ArgsModel`（extra='allow' + `_run` 显式报错）。
   """
   fields: dict[str, Any] = {}
   for name, desc in cap.params.items():
@@ -102,9 +125,7 @@ def _build_args_schema(cap: Capability):
       fields[name] = (str, Field(default='', description=desc))
   # 模型名用 capability 派生，避免重名
   model_name = f'Args_{cap.id.replace(".", "_")}'
-  return create_model(
-    model_name, __config__=ConfigDict(use_enum_values=True), **fields,
-  )
+  return create_model(model_name, __base__=_ArgsModel, **fields)
 
 
 def _records_lists(obj) -> list[list]:
@@ -171,6 +192,16 @@ def _make_tool(cap: Capability, caller: Caller) -> StructuredTool:
   """把一条 Capability 包装成 StructuredTool，闭包绑定其平台 caller。"""
 
   async def _run(**kwargs) -> str:
+    # 未声明参数明确报错（extra='allow' 让它们能到这里）—— 绝不能静默丢：
+    # 模型把 `date` 顺给了没有该参数的告警工具时，丢弃会退化成「按无时间窗全表扫」
+    # （实测捞出 295 万条）。返回纯 JSON（不进「不可信数据」边界），模型据此改正重试。
+    unknown = [k for k in kwargs if k not in cap.params]
+    if unknown:
+      return json.dumps({
+        'error': f'不支持的参数：{", ".join(sorted(unknown))}',
+        'suggestion': f'本工具支持的参数：{", ".join(cap.params) or "无"}；请按这些参数名重试。',
+      }, ensure_ascii=False)
+
     # 过滤掉空串参数，交给 caller（与门面工具行为一致）
     params = {k: v for k, v in kwargs.items() if v not in ('', None)}
 

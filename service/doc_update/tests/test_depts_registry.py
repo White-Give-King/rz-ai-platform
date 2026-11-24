@@ -5,7 +5,7 @@
 
 from config.settings import settings
 from service.doc_update.depts import (
-  configured_groups, configured_names, merge_columns, parse_names, parse_spec,
+  _sort_no, configured_groups, configured_names, merge_columns, parse_names, parse_spec,
 )
 
 
@@ -19,7 +19,9 @@ def test_configured_names_from_settings():
   names = configured_names()
   assert names[:3] == ['A1', 'A2', 'A3'], names
   assert 'A18' in names
-  assert names == sorted(names, key=lambda n: (int(n[1:]), n))
+  # A 区序号不变；廊坊 B 区（B1M1/B1M2）稳定排在 A18 之后（`_sort_no` 给非 A 部门加偏移）
+  assert names.index('A18') < names.index('B1M1') < names.index('B1M2')
+  assert names == sorted(names, key=lambda n: (_sort_no(n), n))
 
 
 def test_merge_columns_keeps_configured_column_when_cache_missing():
@@ -90,13 +92,14 @@ def test_merge_columns_legacy_cache_claimed_by_default_company():
 
 
 def test_default_config_covers_measured_companies():
-  """默认清单 = 实测 5 家国内园区共 21 个部门（去重 12 个部门名）。"""
+  """默认清单 = 实测 5 家国内园区共 23 个部门（去重 14 个部门名，廊坊含 B 区两个）。"""
   groups = configured_groups()
   assert [g['company_name'] for g in groups] == ['廊坊', '平湖', '惠州', '佛山', '重庆']
-  assert sum(len(g['names']) for g in groups) == 21
-  assert len(configured_names()) == 12
+  assert sum(len(g['names']) for g in groups) == 23
+  assert len(configured_names()) == 14
   assert configured_names() == [
     'A1', 'A2', 'A3', 'A5', 'A6', 'A7', 'A8', 'A9', 'A10', 'A11', 'A12', 'A18',
+    'B1M1', 'B1M2',
   ]
 
 

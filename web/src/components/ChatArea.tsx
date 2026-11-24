@@ -1,15 +1,21 @@
-import { useState, useCallback, useEffect, useRef, useMemo, memo } from 'react';
+import {
+  useState, useCallback, useEffect, useRef, useMemo, memo, type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Bot, User, Sparkles, Trash2, Search, Globe, Wrench, SquareTerminal, NotebookPen, FolderOpen, BookOpenText, ChevronDown, FileText, Copy, Check,
-  AlertCircle, RotateCcw, Loader2, MoreHorizontal, Pin, PinOff, Pencil,
+  Bot, Sparkles, Trash2, Search, Globe, Wrench, SquareTerminal, NotebookPen, BookOpenText,
+  ChevronUp, ChevronDown, Dot, Clock3, FileText, Copy, Check,
+  AlertCircle, RotateCcw, Loader2, MoreHorizontal, Pin, PinOff, Pencil, User,
 } from 'lucide-react';
+import { Collapsible } from '@base-ui/react/collapsible';
 import { Input } from './ui/input';
 import MarkdownContent from './MarkdownContent';
+import { CodeHighlight } from './CodeHighlight';
 import ChartRenderer from './ChartRenderer';
 import FileCard from './FileCard';
 import ArtifactPanel from './ArtifactPanel';
 import TodoTray from './TodoTray';
+import { useConfirm } from './confirm-dialog';
 
 function fixMermaidBlocks(text: string): string {
   if (!text) return text;
@@ -63,8 +69,8 @@ function hideIncompleteFile(text: string): string {
   if (text.indexOf('/>', lastOpen) !== -1) return text; // 已闭合，正常渲染
   return text.slice(0, lastOpen); // 未闭合：截掉从 <file 起的部分
 }
-import { useChatStore, collectArtifacts } from '../stores/chatStore';
 import { useAuthStore } from '../stores/authStore';
+import { useChatStore, collectArtifacts } from '../stores/chatStore';
 import ChatInput from './ChatInput';
 import { cn } from '@/lib/utils';
 import { copyText } from '@/lib/clipboard';
@@ -112,12 +118,19 @@ function chartFingerprint(seg: ChartSegment): string {
   return `${seg.attrs.type || ''}|${attrs}|${seg.data}`;
 }
 
-/** 图表限流 + 去重，返回保留段落与被丢张数：
+/** 已保留图表的去重状态（指纹集合 + 各族已用张数），可作下一次 cap 的起点。 */
+type ChartCapState = { fps: Set<string>; families: Map<string, number> };
+
+/** 图表限流 + 去重，返回保留段落、被丢张数与累计状态：
  *  ① 同一张图（指纹相同）**只留第一张**——幂等，让"重复出图"无害（`<file>` 卡早已按 url 去重，图缺的就是这层）；
- *  ② 同族最多 MAX_CHARTS_PER_FAMILY 张。 */
-function capChartsByFamily(segments: MsgSegment[]): { list: MsgSegment[]; dropped: number } {
-  const seen = new Map<string, number>();
-  const seenFp = new Set<string>();
+ *  ② 同族最多 MAX_CHARTS_PER_FAMILY 张。
+ *  `seed` 传入先前已保留的状态（先 cap 最终答案、再 cap 过程段），保证重复的图留在正文而不是折叠区。 */
+function capChartsByFamily(
+  segments: MsgSegment[],
+  seed?: ChartCapState,
+): { list: MsgSegment[]; dropped: number; state: ChartCapState } {
+  const seen = new Map(seed?.families ?? []);
+  const seenFp = new Set(seed?.fps ?? []);
   const list: MsgSegment[] = [];
   let dropped = 0;
   for (const seg of segments) {
@@ -140,7 +153,25 @@ function capChartsByFamily(segments: MsgSegment[]): { list: MsgSegment[]; droppe
     }
     list.push(seg);
   }
-  return { list, dropped };
+  return { list, dropped, state: { fps: seenFp, families: seen } };
+}
+
+/** 按「最后一个工具段」切分：之前（含）是过程旁白 + 工具调用，之后是最终答案。
+ *  依据：模型不可能在 on_tool_start 与 on_tool_end 之间输出文字，所以最终答案一定在最后一条工具结果之后。
+ *  没有工具段 → 全部算答案，不出现折叠头。 */
+function splitProcessAnswer(segments: MsgSegment[]): {
+  processSegs: MsgSegment[];
+  answerSegs: MsgSegment[];
+} {
+  let lastTool = -1;
+  segments.forEach((seg, i) => {
+    if (seg.kind === 'tool') lastTool = i;
+  });
+  if (lastTool === -1) return { processSegs: [], answerSegs: segments };
+  return {
+    processSegs: segments.slice(0, lastTool + 1),
+    answerSegs: segments.slice(lastTool + 1),
+  };
 }
 
 type NonChartSegment = Exclude<MsgSegment, { kind: 'chart' }>;
@@ -276,52 +307,364 @@ function parseMessageSegments(raw: string): MsgSegment[] {
 }
 
 function toolIcon(name: string) {
-  // 联网工具单独给图标（对齐 DeerFlow：web_search 用放大镜、web_fetch 用地球），
-  // 让人一眼看出这一步是"检索"还是"读网页"；其余工具暂时统一 Wrench
-  // （SquareTerminal/NotebookPen/FolderOpen/BookOpenText import 保留备用）
-  void [SquareTerminal, NotebookPen, FolderOpen, BookOpenText];
+  // 按工具类别取图标，一眼看出这一步在做什么（对齐 DeerFlow 的 kind → icon 映射）
   if (name === 'web__search') return Search;
   if (name === 'web__fetch') return Globe;
+  if (name.startsWith('analysis_')) return SquareTerminal;
+  if (name.startsWith('skill__')) return NotebookPen;
+  if (name === 'rag_knowledge_search' || name.startsWith('history_')) return BookOpenText;
   return Wrench;
 }
 
-function ToolCard({ name, args, result }: { name: string; args?: string; result?: string }) {
+/** 时间线的一步（对齐 DeerFlow ChainOfThoughtStep）。
+ *  节点只有一个：有工具图标就用工具图标，没有（旁白/图表/文件）就用 DeerFlow 的默认圆点 Dot。
+ *  竖线在节点正下方，只画本步高度内的一段，不跨步相连。 */
+function TimelineStep({
+  icon: Icon,
+  label,
+  children,
+  isLast = false,
+  active = false,
+}: {
+  icon?: typeof Wrench;
+  label: ReactNode;
+  children?: ReactNode;
+  isLast?: boolean;
+  active?: boolean;
+}) {
+  return (
+    <div
+      className={cn(
+        'flex gap-2 text-sm',
+        active ? 'text-foreground' : 'text-muted-foreground',
+      )}
+    >
+      <div className="relative mt-0.5 shrink-0">
+        {Icon ? <Icon className="size-4" /> : <Dot className="size-4" />}
+        {!isLast && (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute left-1/2 top-5 bottom-0 -mx-px w-px bg-muted-foreground/40"
+          />
+        )}
+      </div>
+      <div className="min-w-0 flex-1 space-y-2 overflow-hidden">
+        <div>{label}</div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** 解析成 JSON 对象（数组/标量/解析失败返回 null），语言判定要用同级的 `path` 字段。 */
+function parseJsonObject(raw?: string): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>;
+  } catch {
+    /* 非 JSON → 原样展示 */
+  }
+  return null;
+}
+
+/** 把工具参数/返回拆成可逐字段复制的行；只处理 JSON 对象，数组/标量返回 null 走整块展示。 */
+function parseFields(raw?: string): { key: string; value: string }[] | null {
+  const obj = parseJsonObject(raw);
+  if (!obj) return null;
+  const rows = Object.entries(obj).map(([k, val]) => ({
+    key: k,
+    value: typeof val === 'string' ? val : JSON.stringify(val, null, 2),
+  }));
+  return rows.length ? rows : null;
+}
+
+/** 写文件类工具里这些字段是文件内容，语言按同级 `path` 的扩展名判定。 */
+const EXT_LANG: Record<string, string> = {
+  py: 'python', js: 'javascript', jsx: 'javascript', ts: 'typescript', tsx: 'typescript',
+  json: 'json', html: 'html', htm: 'html', xml: 'xml', css: 'css', sql: 'sql',
+  md: 'markdown', sh: 'bash', yml: 'yaml', yaml: 'yaml',
+};
+const FILE_CONTENT_TOOLS = new Set(['analysis_write_file', 'analysis_str_replace']);
+const FILE_CONTENT_KEYS = new Set(['content', 'old', 'new']);
+
+/** 工具参数里某个字段的代码语言；返回 null 表示按纯文本展示。 */
+function payloadLanguage(
+  toolName: string | undefined,
+  key: string,
+  obj: Record<string, unknown> | null,
+): string | null {
+  if (toolName === 'analysis_exec' && key === 'python_code') return 'python';
+  if (!toolName || !FILE_CONTENT_TOOLS.has(toolName) || !FILE_CONTENT_KEYS.has(key)) return null;
+  const path = obj?.path;
+  if (typeof path !== 'string') return null;
+  const ext = path.split('.').pop()?.toLowerCase() ?? '';
+  return EXT_LANG[ext] ?? null;
+}
+
+/** 单段文字的复制按钮（复制后 1.5 秒回弹）。 */
+function FieldCopy({ text }: { text: string }) {
+  const [ok, setOk] = useState(false);
+  return (
+    <button
+      type="button"
+      title={ok ? '已复制' : '复制'}
+      onClick={async () => {
+        const r = await copyText(text);
+        setOk(r);
+        setTimeout(() => setOk(false), 1500);
+      }}
+      className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+    >
+      {ok ? <Check className="size-3" /> : <Copy className="size-3" />}
+    </button>
+  );
+}
+
+/** 工具参数/返回的一段：可拆字段时逐字段列表，否则整块；空值给「（空）」标记。 */
+function ToolPayload({
+  title,
+  raw,
+  toolName,
+}: {
+  title: string;
+  raw: string;
+  toolName?: string;
+}) {
+  const obj = parseJsonObject(raw);
+  const fields = parseFields(raw);
+  const empty = raw.trim() === '' || raw.trim() === '{}';
+  return (
+    <section className="min-w-0 space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-muted-foreground">{title}</p>
+        <FieldCopy text={raw} />
+      </div>
+      {empty ? (
+        <p className="rounded bg-[var(--bubble)] px-2 py-1.5 text-muted-foreground">（空）</p>
+      ) : fields ? (
+        <div className="space-y-1.5">
+          {fields.map((f) => {
+            const language = payloadLanguage(toolName, f.key, obj);
+            return (
+              <div key={f.key} className="min-w-0 space-y-0.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
+                    {f.key}
+                  </span>
+                  <FieldCopy text={f.value} />
+                </div>
+                <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-[var(--bubble)] p-2 font-mono">
+                  {language ? <CodeHighlight code={f.value} language={language} /> : f.value}
+                </pre>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-[var(--bubble)] p-2 font-mono">
+          {raw}
+        </pre>
+      )}
+    </section>
+  );
+}
+
+/** 工具步骤：标题一行，参数/返回收在「详情」里（对齐 DeerFlow ToolCallDetails）。 */
+function ToolStep({
+  name,
+  args,
+  result,
+  isLast,
+}: {
+  name: string;
+  args?: string;
+  result?: string;
+  isLast: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const status = useChatStore((s) => s.toolStatus?.[name]);
   const done = result !== undefined;
-  const Icon = toolIcon(name);
   return (
-    <div className="my-2 overflow-hidden rounded-lg border border-border bg-[var(--panel)] text-xs">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/50 transition-colors"
-      >
-        <Icon className="size-3.5 shrink-0 text-primary" />
-        <span className="font-medium font-mono">{name}</span>
-        <span className="text-muted-foreground">
-          {done ? '调用完成' : (status || '调用中...')}
-        </span>
-        <ChevronDown
-          className={cn('ml-auto size-3.5 shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')}
-        />
-      </button>
-      {open && (
-        <div className="space-y-2 border-t border-border px-3 py-2">
-          {args && args !== '{}' && (
-            <div>
-              <p className="mb-1 text-muted-foreground">参数</p>
-              <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono">{args}</pre>
-            </div>
-          )}
-          {result !== undefined && (
-            <div>
-              <p className="mb-1 text-muted-foreground">返回</p>
-              <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono">{result}</pre>
+    <TimelineStep
+      icon={toolIcon(name)}
+      isLast={isLast}
+      active={!done}
+      label={(
+        // 工具框：沿用改造前的气泡式小卡片（描边 + --panel 底），点标题展开参数/返回
+        <div className="overflow-hidden rounded-md border border-border bg-[var(--panel)] text-xs">
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-muted/50"
+          >
+            <span className="min-w-0 flex-1 truncate font-mono font-medium">{name}</span>
+            <span className="shrink-0 text-muted-foreground">
+              {done ? '调用完成' : (status || '调用中…')}
+            </span>
+            <ChevronDown
+              className={cn(
+                'size-3.5 shrink-0 text-muted-foreground transition-transform',
+                open && 'rotate-180',
+              )}
+            />
+          </button>
+          {open && (
+            <div className="space-y-2.5 border-t border-border px-2.5 py-2">
+              {args !== undefined && <ToolPayload title="参数" raw={args} toolName={name} />}
+              {result !== undefined && <ToolPayload title="返回" raw={result} />}
             </div>
           )}
         </div>
       )}
-    </div>
+    />
+  );
+}
+
+/** 答案段渲染：图表网格 / 文件卡 / Markdown 正文（工具段按切分规则不会出现在这里）。 */
+function MessageBlocks({
+  blocks,
+  chartData,
+}: {
+  blocks: MsgBlock[];
+  chartData?: Record<string, unknown>;
+}) {
+  return (
+    <>
+      {blocks.map((block) => {
+        if (block.kind === 'chart-group') {
+          // 连续图表排成响应式网格：auto-fit 按容器实宽定列数（宽屏最多 2~3 列，每列不足
+          // CHART_MIN_COL_PX 就退回单列）。不用 sm:/2xl: 视口断点——气泡宽度随右侧面板
+          // 开合变化，断点会判错。
+          return (
+            <div
+              key={block.items[0].key}
+              className="my-2 grid gap-3"
+              style={{
+                gridTemplateColumns:
+                  `repeat(auto-fit,minmax(min(${CHART_MIN_COL_PX}px,100%),1fr))`,
+              }}
+            >
+              {block.items.map(({ seg, key }) => (
+                <ChartRenderer
+                  key={key}
+                  spec={{
+                    type: seg.attrs.type || '',
+                    attrs: seg.attrs,
+                    // 数据**不从正文取**（模型不再写 JSON —— 正文写会被引号截断、图直接崩）：
+                    // 优先用历史遗留的标签体，否则按 `group` 从服务端注入的数据里查
+                    data: seg.data || jsonOfChart(chartData?.[seg.attrs.group || '']),
+                  }}
+                />
+              ))}
+            </div>
+          );
+        }
+        const { seg, key: i } = block;
+        if (seg.kind === 'file') {
+          return <FileCard key={i} url={seg.url} name={seg.name} />;
+        }
+        if (seg.kind === 'text') {
+          return <MarkdownContent key={i} content={seg.content} />;
+        }
+        // 工具段按切分规则只出现在过程段，答案段不会走到这里
+        return null;
+      })}
+    </>
+  );
+}
+
+/** 处理过程：旁白 + 工具调用收进可折叠时间线，正文只留最终答案（对齐 DeerFlow）。
+ *  用已装的 @base-ui/react Collapsible：Trigger 自带 aria-expanded / 键盘交互，
+ *  Panel 暴露 --collapsible-panel-height，配合 CSS 过渡做展开/收起的高度动画。 */
+function ProcessChain({
+  segments,
+  chartData,
+  open,
+  onOpenChange,
+  streaming,
+}: {
+  segments: MsgSegment[];
+  chartData?: Record<string, unknown>;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  streaming: boolean;
+}) {
+  return (
+    <Collapsible.Root
+      open={open}
+      onOpenChange={(next) => onOpenChange(next)}
+      className="not-prose w-full rounded-lg border border-border/70 p-0.5"
+    >
+      <Collapsible.Trigger className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-sm text-foreground/70 transition-colors hover:bg-muted/50 hover:text-foreground">
+        <ChevronUp
+          className={cn(
+            'size-4 shrink-0 transition-transform duration-200',
+            open && 'rotate-180',
+          )}
+        />
+        {streaming && <Loader2 className="size-4 shrink-0 animate-spin" />}
+        <span className="flex-1 text-left">
+          {open ? '隐藏步骤' : `查看其他 ${segments.length} 个步骤`}
+        </span>
+      </Collapsible.Trigger>
+      <Collapsible.Panel
+        keepMounted
+        className="h-[var(--collapsible-panel-height)] overflow-hidden transition-[height] duration-200 ease-out data-[starting-style]:h-0 data-[ending-style]:h-0"
+      >
+        <div className="space-y-3 px-4 pt-1 pb-2">
+          {segments.map((seg, i) => {
+            const isLast = i === segments.length - 1;
+            if (seg.kind === 'tool') {
+              return (
+                <ToolStep
+                  key={i}
+                  name={seg.name}
+                  args={seg.args}
+                  result={seg.result}
+                  isLast={isLast}
+                />
+              );
+            }
+            if (seg.kind === 'file') {
+              return (
+                <TimelineStep key={i} isLast={isLast} label={<FileCard url={seg.url} name={seg.name} />} />
+              );
+            }
+            if (seg.kind === 'chart') {
+              return (
+                <TimelineStep
+                  key={i}
+                  isLast={isLast}
+                  label={(
+                    <ChartRenderer
+                      spec={{
+                        type: seg.attrs.type || '',
+                        attrs: seg.attrs,
+                        data: seg.data || jsonOfChart(chartData?.[seg.attrs.group || '']),
+                      }}
+                    />
+                  )}
+                />
+              );
+            }
+            return (
+              <TimelineStep
+                key={i}
+                isLast={isLast}
+                label={(
+                  // 套上 assistant-msg 只为取标题/列表排版（这里没有 pre，不会撞工具详情的样式）
+                  <div className="assistant-msg max-w-none text-muted-foreground">
+                    <MarkdownContent content={seg.content} />
+                  </div>
+                )}
+              />
+            );
+          })}
+        </div>
+      </Collapsible.Panel>
+    </Collapsible.Root>
   );
 }
 
@@ -380,6 +723,7 @@ export const MessageBubble = memo(function MessageBubble({
   /** 本会话的图表数据 `{组名: rows}`：正文只写 `<chart group="…"/>`，数据按组名从这里取 */
   chartData?: Record<string, unknown>;
 }) {
+  const confirm = useConfirm();
   const segments = useMemo(() => {
     const raw = msg.content || '';
     const parsed = parseMessageSegments(raw);
@@ -400,12 +744,20 @@ export const MessageBubble = memo(function MessageBubble({
       return true;
     });
   }, [msg.content, isStreaming, isLast]);
-  // 同族限流（约束 9 的兜底）→ 再按连续图分组排网格
-  const { list: cappedSegments, dropped: droppedCharts } = useMemo(
-    () => capChartsByFamily(segments),
-    [segments],
+  // 按最后一个工具段切分：之前（含）是过程旁白 + 工具调用，之后是最终答案
+  const { processSegs, answerSegs } = useMemo(() => splitProcessAnswer(segments), [segments]);
+  // 图表限流/去重**先 cap 答案、再以答案的状态为 seed cap 过程**：同一张图在旁白与总结里
+  // 各出一次时，保留正文那张，避免重复图被折叠区抢走
+  const answerCapped = useMemo(() => capChartsByFamily(answerSegs), [answerSegs]);
+  const processCapped = useMemo(
+    () => capChartsByFamily(processSegs, answerCapped.state),
+    [processSegs, answerCapped],
   );
-  const blocks = useMemo(() => groupChartSegments(cappedSegments), [cappedSegments]);
+  const droppedCharts = answerCapped.dropped + processCapped.dropped;
+  const answerBlocks = useMemo(
+    () => groupChartSegments(answerCapped.list),
+    [answerCapped.list],
+  );
   const isAssistant = msg.role === 'assistant';
   // 空气泡：流式且最后一条且尚无任何内容时，显示思考指示器替代空泡
   const showThinking = isAssistant && isStreaming && isLast && !(msg.content || '').trim();
@@ -414,14 +766,47 @@ export const MessageBubble = memo(function MessageBubble({
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
 
+  // 处理过程折叠：流式中展开，结束后约 1 秒自动收起；用户手动点过就不再强制收
+  const [processOpen, setProcessOpen] = useState(false);
+  const userToggled = useRef(false);
+  const wasStreaming = useRef(false);
+  const collapseTimer = useRef<number | null>(null);
+  const streamingNow = isAssistant && isStreaming && isLast;
+  useEffect(() => {
+    if (streamingNow) {
+      if (!wasStreaming.current) userToggled.current = false;
+      wasStreaming.current = true;
+      setProcessOpen(true);
+    } else if (wasStreaming.current) {
+      wasStreaming.current = false;
+      if (userToggled.current) return;
+      collapseTimer.current = window.setTimeout(() => setProcessOpen(false), 1000);
+      return () => {
+        if (collapseTimer.current !== null) {
+          window.clearTimeout(collapseTimer.current);
+          collapseTimer.current = null;
+        }
+      };
+    }
+  }, [streamingNow]);
+
+  const handleProcessOpenChange = (next: boolean) => {
+    userToggled.current = true;
+    if (collapseTimer.current !== null) {
+      window.clearTimeout(collapseTimer.current);
+      collapseTimer.current = null;
+    }
+    setProcessOpen(next);
+  };
+
   const handleCopy = async () => {
     // 只复制正文：msg.content 里混着 <tool-call>/<tool-result>/<chart>/<file>/<plan> 等内部标记，
-    // 整段拷会把工具参数与返回（一大坨 JSON）一起塞给用户。这里只取 parse 出来的文本段。
-    const parts: string[] = [];
-    for (const seg of segments) {
-      if (seg.kind === 'text') parts.push(seg.content.trim());
-    }
-    const text = parts.filter(Boolean).join('\n\n');
+    // 整段拷会把工具参数与返回（一大坨 JSON）一起塞给用户。优先只取最终答案段的文本，
+    // 答案为空（例如整轮只调工具、没写最终文本）时回退到全部文本段。
+    const textOf = (segs: MsgSegment[]) =>
+      segs.filter((seg) => seg.kind === 'text').map((seg) => seg.content.trim())
+        .filter(Boolean).join('\n\n');
+    const text = textOf(answerSegs) || textOf(segments);
     if (!text) {
       // 整条回答只有工具卡片/图表、没有正文 → 没东西可拷，别谎报"已复制"
       setCopyFailed(true);
@@ -439,35 +824,33 @@ export const MessageBubble = memo(function MessageBubble({
     }, 1500);
   };
 
-  const handleDelete = () => {
-    if (window.confirm('删除这条回答？')) {
-      void deleteMessage(msg.session_id, msg.message_id);
-    }
+  const handleDelete = async () => {
+    const ok = await confirm({
+      title: '删除这条回答？',
+      confirmText: '删除',
+      variant: 'destructive',
+    });
+    if (ok) await deleteMessage(msg.session_id, msg.message_id);
   };
 
   return (
     <div
       data-mid={msg.message_id}
-      className={cn('flex gap-3', msg.role === 'user' && 'flex-row-reverse')}
+      className={cn('group flex gap-3', !isAssistant && 'flex-row-reverse')}
     >
       <div
         className={cn(
           'flex size-8 shrink-0 items-center justify-center rounded-lg',
-          msg.role === 'user'
-            ? 'bg-secondary text-secondary-foreground'
-            : 'bg-primary/20 text-primary',
+          !isAssistant ? 'bg-secondary text-secondary-foreground' : 'bg-primary/20 text-primary',
         )}
       >
-        {msg.role === 'user'
-          ? <User className="size-4" />
-          : <Bot className="size-4" />
-        }
+        {!isAssistant ? <User className="size-4" /> : <Bot className="size-4" />}
       </div>
-      <div className={cn('min-w-0 max-w-[80%] break-words', msg.role === 'user' && 'flex flex-col items-end')}>
+      <div className={cn('min-w-0 max-w-[80%] break-words', !isAssistant && 'flex flex-col items-end')}>
         <p className="mb-1 text-xs font-medium text-muted-foreground">
-          {msg.role === 'user' ? userName : 'AI 助手'}
+          {!isAssistant ? userName : 'AI 助手'}
         </p>
-        {msg.role === 'user' && msg.uploaded_filenames && msg.uploaded_filenames.length > 0 && (
+        {!isAssistant && msg.uploaded_filenames && msg.uploaded_filenames.length > 0 && (
           <div className="mb-1.5 flex flex-wrap justify-end gap-1.5">
             {msg.uploaded_filenames.map((name) => (
               <span
@@ -484,94 +867,64 @@ export const MessageBubble = memo(function MessageBubble({
         <div
           className={cn(
             'rounded-2xl px-4 py-2.5 text-sm leading-relaxed',
-            // 气泡底色走 --bubble（浅米色），不用全局 --secondary：后者是冷色(hue 247)，摆在新
-            // 的暖白页面上显浅蓝；而且 --secondary 还被输入框胶囊/按钮/徽标/搜索框复用，改它会
-            // 连带改到输入区。深色/黑色主题里 --bubble 等于各自 --secondary，观感不变。
-            msg.role === 'user'
-              ? 'rounded-tr-sm bg-[var(--bubble)] text-secondary-foreground'
-              : 'rounded-tl-sm bg-[var(--bubble)] text-secondary-foreground',
+            // 气泡底色走 --bubble（浅米色），不用全局 --secondary（后者还被输入框胶囊/按钮/徽标复用）
+            'bg-[var(--bubble)] text-secondary-foreground',
+            !isAssistant ? 'rounded-tr-sm' : 'rounded-tl-sm',
           )}
         >
           {isAssistant ? (
-            <div className="assistant-msg max-w-none">
-              {showThinking ? (
-                <div className="flex items-center gap-1.5 py-1">
-                  <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
-                  <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:150ms]" />
-                  <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:300ms]" />
-                  <span className="ml-1 text-xs text-muted-foreground">正在思考…</span>
-                </div>
-              ) : (
-                <>
-                {blocks.map((block) => {
-                if (block.kind === 'chart-group') {
-                  // 连续图表排成响应式网格：auto-fit 按容器实宽定列数（宽屏最多 2~3 列，每列不足
-                  // CHART_MIN_COL_PX 就退回单列）。不用 sm:/2xl: 视口断点——气泡宽度随右侧面板
-                  // 开合变化，断点会判错。
-                  return (
-                    <div
-                      key={block.items[0].key}
-                      className="my-2 grid gap-3"
-                      style={{
-                        gridTemplateColumns:
-                          `repeat(auto-fit,minmax(min(${CHART_MIN_COL_PX}px,100%),1fr))`,
-                      }}
-                    >
-                      {block.items.map(({ seg, key }) => (
-                        <ChartRenderer
-                          key={key}
-                          spec={{
-                            type: seg.attrs.type || '',
-                            attrs: seg.attrs,
-                            // 数据**不从正文取**（模型不再写 JSON —— 正文写会被引号截断、图直接崩）：
-                            // 优先用历史遗留的标签体，否则按 `group` 从服务端注入的数据里查
-                            data: seg.data || jsonOfChart(chartData?.[seg.attrs.group || '']),
-                          }}
-                        />
-                      ))}
-                    </div>
-                  );
-                }
-                const { seg, key: i } = block;
-                if (seg.kind === 'tool') {
-                  return <ToolCard key={i} name={seg.name} args={seg.args} result={seg.result} />;
-                }
-                if (seg.kind === 'file') {
-                  return <FileCard key={i} url={seg.url} name={seg.name} />;
-                }
-                return <MarkdownContent key={i} content={seg.content} />;
-              })}
-                {droppedCharts > 0 && (
-                  // 同族图超过上限被隐去（约束 9 的前端兜底）；明说一句，免得用户以为内容丢了
-                  <p className="mt-1.5 text-xs text-muted-foreground">
-                    （另有 {droppedCharts} 张同类/重复图已省略）
-                  </p>
+            showThinking ? (
+              <div className="flex items-center gap-1.5 py-1">
+                <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
+                <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:150ms]" />
+                <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:300ms]" />
+                <span className="ml-1 text-xs text-muted-foreground">正在思考…</span>
+              </div>
+            ) : (
+              <>
+                {/* 处理过程放在 .assistant-msg 之外：避免继承正文的 ol/li/pre 排版（时间线会散） */}
+                {processCapped.list.length > 0 && (
+                  <ProcessChain
+                    segments={processCapped.list}
+                    chartData={chartData}
+                    open={processOpen}
+                    onOpenChange={handleProcessOpenChange}
+                    streaming={streamingNow}
+                  />
                 )}
-                {isAssistant && isStreaming && isLast && !msg.streamError && (
-                  <div className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
-                    <span className="size-1.5 animate-pulse rounded-full bg-primary/60" />
-                    <span>正在生成…</span>
-                  </div>
-                )}
-                {msg.streamError && (
-                  <div className="mt-2 flex flex-col items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2">
-                    <p className="flex items-center gap-1.5 text-sm text-destructive">
-                      <AlertCircle className="size-4 shrink-0" />
-                      {msg.streamError}
+                <div className={cn('assistant-msg max-w-none', processCapped.list.length > 0 && 'mt-2')}>
+                  <MessageBlocks blocks={answerBlocks} chartData={chartData} />
+                  {droppedCharts > 0 && (
+                    // 同族图超过上限被隐去（约束 9 的前端兜底）；明说一句，免得用户以为内容丢了
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      （另有 {droppedCharts} 张同类/重复图已省略）
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => void retryFailed()}
-                      className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-foreground transition-colors hover:bg-muted"
-                    >
-                      <RotateCcw className="size-3" />
-                      重试
-                    </button>
-                  </div>
-                )}
-                </>
-              )}
-            </div>
+                  )}
+                  {isStreaming && isLast && !msg.streamError && (
+                    <div className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <Clock3 className="size-3.5 shrink-0 animate-pulse" />
+                      <span>正在生成…</span>
+                    </div>
+                  )}
+                  {msg.streamError && (
+                    <div className="mt-2 flex flex-col items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2">
+                      <p className="flex items-center gap-1.5 text-sm text-destructive">
+                        <AlertCircle className="size-4 shrink-0" />
+                        {msg.streamError}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void retryFailed()}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-foreground transition-colors hover:bg-muted"
+                      >
+                        <RotateCcw className="size-3" />
+                        重试
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </>
+            )
           ) : (
             <p className="whitespace-pre-line">{msg.content}</p>
           )}
@@ -594,7 +947,7 @@ export const MessageBubble = memo(function MessageBubble({
             )}
             <button
               type="button"
-              onClick={handleDelete}
+              onClick={() => void handleDelete()}
               data-tip="删除"
               className="rounded p-1 text-muted-foreground/70 transition-colors hover:bg-muted/60 hover:text-destructive"
             >
@@ -608,6 +961,7 @@ export const MessageBubble = memo(function MessageBubble({
 });
 
 export default function ChatArea() {
+  const confirm = useConfirm();
   const {
     messages, isStreaming, isLoadingMessages, sessions, currentSessionId,
     selectSession, deleteSession, pinSession, renameSession, sessionPanelOpen, closeSessionPanel,
@@ -620,6 +974,9 @@ export default function ChatArea() {
   const pendingJump = useChatStore((s) => s.pendingJump);
   const clearPendingJump = useChatStore((s) => s.clearPendingJump);
   const listRef = useRef<HTMLDivElement>(null);
+  // 是否贴着底部：用户上翻阅读时不跟随流式输出，只在回到底部后恢复自动滚动
+  const atBottomRef = useRef(true);
+  const [showJumpBottom, setShowJumpBottom] = useState(false);
   const [sessionSearch, setSessionSearch] = useState('');
   // 会话项省略号菜单 + 行内重命名状态。菜单用 fixed 定位向右弹（避开侧栏 overflow 裁剪），
   // 记录触发按钮的位置；省略号选中时显示气泡高亮。
@@ -665,9 +1022,30 @@ export default function ChatArea() {
     if (listRef.current) {
       listRef.current.scrollTop = listRef.current.scrollHeight;
     }
+    atBottomRef.current = true;
+    setShowJumpBottom(false);
   }, []);
 
-  useEffect(() => { scrollToBottom(); }, [messages, scrollToBottom]);
+  // 只有贴着底部时才跟随新内容；用户上翻后流式输出不再把视图拽回底部。
+  // 例外：用户刚发出提问（最后一条是 user）时强制回到底部，否则看不到自己的消息。
+  useEffect(() => {
+    const last = messages[messages.length - 1];
+    if (atBottomRef.current || last?.role === 'user') scrollToBottom();
+  }, [messages, scrollToBottom]);
+
+  // 切会话：新会话一律从底部开始跟随
+  useEffect(() => {
+    atBottomRef.current = true;
+    setShowJumpBottom(false);
+  }, [currentSessionId]);
+
+  const handleListScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    atBottomRef.current = near;
+    setShowJumpBottom(!near);
+  };
 
   // 铃铛通知跳转：切到目标会话后，滚动到通知对应的那条回答并短暂高亮；
   // 该回复已不可定位（重载后 id 变化/已删除）→ 回退到该会话最新一条助手回复，再兜底到底部。
@@ -838,7 +1216,11 @@ export default function ChatArea() {
                       onClick={(e) => {
                         e.stopPropagation();
                         setMenu(null);
-                        if (window.confirm(`删除会话「${s.title}」？`)) deleteSession(s.session_id);
+                        void confirm({
+                          title: `删除会话「${s.title}」？`,
+                          confirmText: '删除',
+                          variant: 'destructive',
+                        }).then((ok) => { if (ok) void deleteSession(s.session_id); });
                       }}
                       className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-destructive hover:bg-destructive/10"
                     >
@@ -864,35 +1246,52 @@ export default function ChatArea() {
       <div className="flex min-h-0 flex-1 overflow-hidden rounded-none border-0 lg:rounded-xl lg:border lg:border-border bg-background">
         <div className="flex min-w-0 min-h-0 flex-1 flex-col">
           {/* Messages */}
-          <div ref={listRef} className="flex-1 space-y-5 overflow-y-auto p-4 [touch-action:pan-y]">
-            {isLoadingMessages ? (
-              <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="size-4 animate-spin" />
-                加载会话…
-              </div>
-            ) : messages.length === 0 ? (
-              <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-                <div className="flex size-14 items-center justify-center rounded-2xl bg-primary/10">
-                  <Bot className="size-7 text-primary" />
+          <div className="relative min-h-0 flex-1">
+            <div
+              ref={listRef}
+              onScroll={handleListScroll}
+              className="h-full space-y-5 overflow-y-auto p-4 [touch-action:pan-y]"
+            >
+              {isLoadingMessages ? (
+                <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  加载会话…
                 </div>
-                <div>
-                  <p className="text-sm font-semibold">智能运维助手</p>
-                  <p className="mt-1 text-xs text-muted-foreground max-w-xs">
-                    欢迎使用润泽 AI 平台，一个面向数据中心运维的超级智能体。可以帮您检索知识文档、分析业务数据，还能识别安全隐患、生成图表看板、制作报告与视频等。
-                  </p>
+              ) : messages.length === 0 ? (
+                <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+                  <div className="flex size-14 items-center justify-center rounded-2xl bg-primary/10">
+                    <Bot className="size-7 text-primary" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold">智能运维助手</p>
+                    <p className="mt-1 text-xs text-muted-foreground max-w-xs">
+                      欢迎使用润泽 AI 平台，一个面向数据中心运维的超级智能体。可以帮您检索知识文档、分析业务数据，还能识别安全隐患、生成图表看板、制作报告与视频等。
+                    </p>
+                  </div>
                 </div>
-              </div>
-            ) : (
-              messages.map((msg: Message, idx: number) => (
-                <MessageBubble
-                  key={msg.message_id}
-                  msg={msg}
-                  isStreaming={isStreaming}
-                  isLast={idx === messages.length - 1}
-                  userName={user?.name || user?.phone || '我'}
-                  chartData={currentSessionId ? sessionChartData[currentSessionId] : undefined}
-                />
-              ))
+              ) : (
+                messages.map((msg: Message, idx: number) => (
+                  <MessageBubble
+                    key={msg.message_id}
+                    msg={msg}
+                    isStreaming={isStreaming}
+                    isLast={idx === messages.length - 1}
+                    userName={user?.name || user?.phone || '我'}
+                    chartData={currentSessionId ? sessionChartData[currentSessionId] : undefined}
+                  />
+                ))
+              )}
+            </div>
+            {showJumpBottom && (
+              <button
+                type="button"
+                aria-label="回到底部"
+                title="回到底部"
+                onClick={scrollToBottom}
+                className="absolute bottom-4 right-4 z-10 flex size-8 items-center justify-center rounded-full border border-border bg-card text-muted-foreground shadow-md transition-colors hover:text-foreground"
+              >
+                <ChevronDown className="size-4" />
+              </button>
             )}
           </div>
 

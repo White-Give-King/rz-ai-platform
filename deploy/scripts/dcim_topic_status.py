@@ -25,7 +25,10 @@ from service.dcim_ingest.config import clusters, consumer_config  # noqa: E402
 
 
 # consumer 专属项：AdminClient 拿到这些会**每条都刷一遍** CONFWARN 到 stderr，把表格淹掉
-_CONSUMER_ONLY = ('group.id', 'enable.auto.commit', 'auto.offset.reset', 'enable.partition.eof')
+_CONSUMER_ONLY = (
+  'group.id', 'enable.auto.commit', 'auto.offset.reset', 'enable.partition.eof',
+  'max.poll.interval.ms',
+)
 
 
 def admin_config(cluster) -> dict:

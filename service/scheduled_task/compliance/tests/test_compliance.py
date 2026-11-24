@@ -105,20 +105,31 @@ def test_row_transforms() -> None:
   start_s = now_s - 3600
   end_s = now_s
 
+  # 事后补单：10 分钟后才响应（阈值 5 分钟）→ 仍算超时，超时为超出阈值的部分
   rows = _with_query([{
     'cluster': '廊坊A', 'order_no': 'wo-1', 'space_name': '廊坊园区A1数据中心',
     'device_name': '空调1', 'point_name': '回风温度', 'alarm_level': 4,
     'content': '温度过高', 'alarm_time': now_s - 1200,
-    'response_time': now_s - 600, 'responder': '张三', 'handler': '李四',
-    'alarm_status': '1',
+    'response_time': now_s - 600, 'alarm_status': '1',
   }], checks.response_timeout, start_s, end_s, now_s)
   row = rows[0]
   _ok(row['级别'] == '紧急' and row['工单号'] == 'wo-1', '告警级别解码/工单号')
   _ok(row['园区'] == '廊坊', 'cluster → 园区名')
-  _ok(row['响应时长(分钟)'] == 10.0, '响应时长 = 响应 − 告警')
   _ok(row['告警时间'] == checks.fmt_ts(now_s - 1200), '告警时间渲染')
-  _ok(row['响应时间'] == checks.fmt_ts(now_s - 600), '响应时间渲染')
+  _ok(row['响应时间'] == checks.fmt_ts(now_s - 600), '事后补单仍给出实际响应时间')
+  _ok(row['超时时间(分钟)'] == 5.0, '超时时间 = 响应 − 告警 − 阈值')
   _ok(row['当前告警状态'] == '触发', '告警状态解码')
+
+  # 一直没响应：响应时间留空，超时按当前时刻算
+  rows = _with_query([{
+    'cluster': '平湖B', 'order_no': None, 'space_name': '', 'device_name': 'UPS',
+    'point_name': '输出电压', 'alarm_level': 3, 'content': '电压异常',
+    'alarm_time': now_s - 1200, 'response_time': None, 'alarm_status': '2',
+  }], checks.response_timeout, start_s, end_s, now_s)
+  row = rows[0]
+  _ok(row['工单号'] == '' and row['响应时间'] == '', '未建单：工单号/响应时间留空')
+  _ok(row['超时时间(分钟)'] == 15.0, '未建单：超时按当前时刻算')
+  _ok(row['当前告警状态'] == '刷新', '刷新态也算未解除')
 
   rows = _with_query([{
     'cluster': '平湖B', 'order_no': 'wo-1', 'space_name': '平湖园区', 'device_name': 'UPS',
@@ -181,9 +192,9 @@ def test_columns_match_rows() -> None:
   now_s = int(_at(date(2026, 10, 27), 9, 0).timestamp())
   samples = {
     'response_timeout': [{
-      'cluster': '廊坊A', 'order_no': '', 'space_name': '', 'device_name': '',
+      'cluster': '廊坊A', 'space_name': '', 'device_name': '',
       'point_name': '', 'alarm_level': 3, 'content': '', 'alarm_time': now_s - 60,
-      'response_time': now_s, 'responder': '', 'handler': '', 'alarm_status': '3',
+      'alarm_status': '3', 'order_no': '', 'response_time': now_s,
     }],
     'unclosed_order': [{
       'cluster': '廊坊A', 'order_no': '', 'space_name': '', 'device_name': '',
@@ -211,6 +222,15 @@ def test_columns_match_rows() -> None:
     columns = checks.COLUMNS[check['key']]
     _ok(tuple(rows[0].keys()) == columns, f"{check['key']} 行键顺序与列声明一致")
   _ok(set(checks._RUNNERS) == {c['key'] for c in checks.CHECKS}, '运行器与注册表一一对应')
+
+
+def test_response_timeout_sql_caliber() -> None:
+  """防口径静默退回「已响应但慢」：必须告警为主表、未解除、阈值内无单。"""
+  sql = checks._RESPONSE_TIMEOUT_SQL
+  for token in ('FROM dcim_alarms a', "a.status <> '3'", 'a.alarm_level >= 3',
+                'NOT EXISTS', 'a.alarm_time <= %s'):
+    _ok(token in sql, f'响应超时 SQL 应含 {token}')
+  _ok('response_time - a.alarm_time' not in sql, '不能退回「已响应但慢」口径')
 
 
 # ==================== 汇总 / 总览矩阵 ====================

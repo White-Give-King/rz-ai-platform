@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
+import {
+  useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
-import { AlertCircle, ChevronLeft, ChevronRight, Loader2, Search, X } from 'lucide-react';
+import { AlertCircle, ChevronLeft, ChevronRight, Inbox, Loader2, Search, X } from 'lucide-react';
 import client from '../api/client';
 import { Input } from './ui/input';
 
@@ -118,10 +120,23 @@ function PreviewImage({ url, title }: { url: string; title: string }) {
 
 /** 数据集可交互表格：拉 /records JSON，本地分页 + 关键字搜索 + 点击列排序。
  *  `adaptive`：宽表模式（事件统计表）——按非空内容自适应列宽、长文本多行不截断。
- *  `imageColumns`：按列名声明图片列，单元格渲染缩略图而不是 URL 文本（默认空，行为不变）。 */
+ *  `imageColumns`：按列名声明图片列，单元格渲染缩略图而不是 URL 文本（默认空，行为不变）。
+ *  `cellTones`：列名 → 值 → className，命中的单元格渲染成彩色胶囊（默认空）。
+ *  `rowAccent`：按隐藏行键给整行加左侧色条（默认空，行为不变）。
+ *  `emptyText`：数据为 0 行时的空状态文案（默认「暂无数据」）。
+ *  `headerLeft`：头部左侧自定义内容（如看板的工作表切换胶囊），提供时替代默认的 `name` 标题。
+ *  `timeout`：拉取超时毫秒（默认不传 → 沿用 client 默认值，行为不变）。 */
 export function RecordsTable(
-  { url, name, adaptive = false, imageColumns = [] }: {
+  {
+    url, name, adaptive = false, imageColumns = [], cellTones, rowAccent, emptyText, headerLeft,
+    timeout,
+  }: {
     url: string; name: string; adaptive?: boolean; imageColumns?: string[];
+    cellTones?: Record<string, Record<string, string>>;
+    rowAccent?: { key: string; tones: Record<string, string> };
+    emptyText?: string;
+    headerLeft?: ReactNode;
+    timeout?: number;
   },
 ) {
   const [data, setData] = useState<RecordsData | null>(null);
@@ -134,7 +149,7 @@ export function RecordsTable(
     let cancelled = false;
     setError('');
     client
-      .get(url.replace(/^\/api\/v1/, ''))
+      .get(url.replace(/^\/api\/v1/, ''), timeout ? { timeout } : undefined)
       .then((resp) => {
         if (cancelled) return;
         setData(resp.data);
@@ -146,7 +161,7 @@ export function RecordsTable(
     return () => {
       cancelled = true;
     };
-  }, [url]);
+  }, [url, timeout]);
 
   const filtered = useMemo(() => {
     if (!data) return [];
@@ -259,8 +274,12 @@ export function RecordsTable(
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-background text-[13px]">
-      <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-        <span className="min-w-0 flex-1 truncate text-sm font-semibold">{name}</span>
+      <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
+        {headerLeft ? (
+          <div className="min-w-0 flex-1">{headerLeft}</div>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-sm font-semibold">{name}</span>
+        )}
         {data && <span className="shrink-0 text-muted-foreground">共 {filtered.length} 行</span>}
         <div className="relative shrink-0">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
@@ -282,6 +301,13 @@ export function RecordsTable(
         ) : !data ? (
           <div className="flex items-center justify-center p-6">
             <Loader2 className="size-4 animate-spin text-muted-foreground" />
+          </div>
+        ) : !filtered.length ? (
+          <div className="flex h-full flex-col items-center justify-center gap-2 px-4 py-10 text-center">
+            <Inbox className="size-8 text-muted-foreground/50" />
+            <p className="text-sm text-muted-foreground">
+              {query ? '没有匹配的记录' : (emptyText || '暂无数据')}
+            </p>
           </div>
         ) : (
           <table
@@ -313,43 +339,58 @@ export function RecordsTable(
               </tr>
             </thead>
             <tbody>
-              {pageRows.map((r, i) => (
-                <tr key={i} className="border-b border-border/50 last:border-0 even:bg-muted/25 hover:bg-muted/50">
-                  {cols.map((c) => {
-                    const text = String(r[c] ?? '');
-                    if (imageColumns.includes(c)) {
+              {pageRows.map((r, i) => {
+                const accent = rowAccent
+                  ? (rowAccent.tones[String(r[rowAccent.key] ?? '')] ?? '')
+                  : '';
+                return (
+                  <tr key={i} className="border-b border-border/50 last:border-0 even:bg-muted/25 hover:bg-muted/50">
+                    {cols.map((c, colIdx) => {
+                      const text = String(r[c] ?? '');
+                      const tdClass = 'px-3 py-2 align-top'
+                        + (colIdx === 0 && accent ? ` border-l-[3px] ${accent}` : '');
+                      if (imageColumns.includes(c)) {
+                        return (
+                          <td key={c} style={{ width: widthOf(c) }} className={tdClass}>
+                            {text && (
+                              <ImageCell url={text}
+                                onOpen={(u) => setExpanded({ title: '图片预览', text: u, image: u })} />
+                            )}
+                          </td>
+                        );
+                      }
+                      const tone = cellTones?.[c]?.[text];
+                      if (tone) {
+                        return (
+                          <td key={c} style={{ width: widthOf(c) }} className={tdClass}>
+                            <span className={
+                              `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${tone}`
+                            }>
+                              {text}
+                            </span>
+                          </td>
+                        );
+                      }
                       return (
-                        <td key={c} style={{ width: widthOf(c) }} className="px-3 py-2 align-top">
-                          {text && (
-                            <ImageCell url={text}
-                              onOpen={(u) => setExpanded({ title: '图片预览', text: u, image: u })} />
-                          )}
+                        <td key={c} style={{ width: widthOf(c) }} className={tdClass}>
+                          <div
+                            title={text}
+                            onClick={text ? () => setExpanded({ title: c, text }) : undefined}
+                            className={
+                              (adaptive
+                                ? 'whitespace-pre-wrap break-words'
+                                : 'line-clamp-3 whitespace-pre-wrap break-words')
+                              + (text ? ' cursor-pointer hover:text-primary' : '')
+                            }
+                          >
+                            {text}
+                          </div>
                         </td>
                       );
-                    }
-                    return (
-                      <td
-                        key={c}
-                        style={{ width: widthOf(c) }}
-                        className="px-3 py-2 align-top"
-                      >
-                        <div
-                          title={text}
-                          onClick={text ? () => setExpanded({ title: c, text }) : undefined}
-                          className={
-                            (adaptive
-                              ? 'whitespace-pre-wrap break-words'
-                              : 'line-clamp-3 whitespace-pre-wrap break-words')
-                            + (text ? ' cursor-pointer hover:text-primary' : '')
-                          }
-                        >
-                          {text}
-                        </div>
-                      </td>
-                    );
-                  })}
-                </tr>
-              ))}
+                    })}
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

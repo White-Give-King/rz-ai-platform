@@ -55,8 +55,15 @@ def _id_of(row: dict) -> str:
 
 
 def _sort_no(name: str) -> int:
-  m = re.search(r'\d+', name or '')
-  return int(m.group()) if m else 10**6
+  """排序号：`A<n>` 保留原数值顺序；其余（含廊坊 B 区 `B1M1`）排在 A 区之后。
+
+  `B1M1` 若沿用「取第一个数字」会得 1、排到 A1 前面，这里给非 A 部门加 10**4 偏移。
+  """
+  m = re.fullmatch(r'A(\d+)', (name or '').strip().upper())
+  if m:
+    return int(m.group(1))
+  digits = re.search(r'\d+', name or '')
+  return 10 ** 4 + int(digits.group()) if digits else 10 ** 6
 
 
 def parse_names(raw: str) -> list[str]:
@@ -174,6 +181,11 @@ async def _load_registry() -> dict[tuple[str, str], dict]:
     key = _row_key(row)
     out[key] = {**dict(row), 'company_id': key[0]}
   return out
+
+
+async def cached_registry() -> list[dict]:
+  """只读注册表缓存（不联网、不写库）；`probe` 等诊断入口用，避免落库。"""
+  return list((await _load_registry()).values())
 
 
 async def _save_registry(rows: list[dict]) -> None:

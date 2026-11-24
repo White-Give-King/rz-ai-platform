@@ -170,6 +170,14 @@ async def _post_capture(payload: dict) -> dict:
   return data
 
 
+async def capture_raw(payload: dict) -> dict:
+  """原样转发一次捕获请求（调用方自己拼 recipe；不依赖会话/thread_id）。
+
+  给「不属于任何对话线程」的调用方用（如文档更新检查的目录截图）。
+  """
+  return await _post_capture(payload)
+
+
 def _publish_bytes(thread_id: str, base: str, data: bytes, ext: str = 'png') -> str:
   """原子发布会话产物（绝不覆盖同名文件），返回文件名。
 

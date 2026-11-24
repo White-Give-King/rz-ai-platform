@@ -11,6 +11,7 @@
 """
 
 import logging
+import re
 
 from core.agent.query_planner import IntentPlan
 
@@ -88,6 +89,8 @@ _CATEGORY_KEYWORDS: list[tuple[tuple[str, ...], str]] = [
   (('人员', '员工', '部门', '分部', '负责人', '培训', '名单', '档案', '职位', '工号',
     '我的信息', '我的部门'), 'org'),
   (('巡检',), 'inspection'),
+  # 演练：演练计划/周安排查询（与内置审查工具 drill_compliance_audit 分工不同）
+  (('演练', '应急演练', '演练计划'), 'drill'),
   (('设备台账', '设备', '台账'), 'device'),
   (('维护计划', '维护', '保养', '维修'), 'maintenance'),
   # 注意**没有「温度」**：它原是 mgmt 告警的口语兜底，但会让「温度曲线」**恰好命中 1 类**
@@ -147,6 +150,12 @@ _QUERY_TOOLS: list[tuple[tuple[str, ...], list[str]]] = [
    ['mgmt.query_pending_ticket', 'mgmt.query_my_info']),
   (('阈值单', '阈值工单', '阈值'),
    ['mgmt.query_threshold_ticket', 'mgmt.query_threshold_ticket_detail', *_RESOLVERS]),
+  # 演练：计划/周明细 + 公司/部门解析工具。A1/A18 这类名称在多家公司同名（A1分部在润泽/
+  # 海外/平湖/佛山/重庆 5 家都有），必须先定公司 —— 故同轮 promote 公司/部门工具；
+  # 去掉 query_dept_by_name（它只返回同名部门中的一条，实测 A1 解析到海外园区且该部门无计划）。
+  (('演练', '应急演练', '演练计划'),
+   ['mgmt.query_drill_plans', 'mgmt.query_drill_week',
+    'mgmt.query_pen_company_dept', 'mgmt.query_company_list', 'mgmt.query_dept_list']),
   # 口语里常说「服务工单」而非「供应商工单」：只登记后者会让精准表 miss → 落到类别
   # 正则（「服务工单」含「工单」+「例行维护」含「维护」= 命中 2 类，不满足「恰好 1 类」）
   # → 走 LLM planner 兜底，白付一次 planner LLM 且整组 promote 14 个工具
@@ -203,6 +212,51 @@ def match_query_caps(message: str) -> list[str]:
   return out
 
 
+# 内置扩展桶 → 工具名的正则预 promote。**只登记工具名，绝不登记技能**：`skill__*`
+# （skill__incident_report 等）本来就走技能入口、常驻可见，不参与这张表；技能管理类
+# 说法也不在这里（skill_manage 由 <extension-tools> 扩展段 + tool_search 承担）。
+#
+# 命中即**独占返回**（与 _STAT_QUERY_TOOLS 同语义）：这些是确定性流水线，混入平台
+# 工具只会干扰；缺的另一半模型可再 tool_search。**必须排在平台表之前**——「事件统计」
+# 含「事件」会被 _QUERY_TOOLS 判成事件工单、「日常变更」含「变更」会命中变更单、
+# 「演练合规」含「演练」会命中演练计划，顺序反了就永远到不了这里。
+#
+# **刻意避开跨平台/跨业务的裸词**：裸「视频」（视频监控是设备/文档域）、裸「演练」
+# （= 演练计划查询）、裸「变更统计」（= mgmt.query_change_statistics）、裸「事件」
+# （= 事件工单）。「提醒我」也带定时线索才认，避免「提醒我查一下昨天告警」被拐走。
+# 桶之间按**首次命中**取，顺序＝特异性从高到低（change_notice 在 incident 之前，
+# 否则「变更通报」里的「通报」会顺带 promote 事件统计工具）。
+_BUILTIN_QUERY_TOOLS: list[tuple[tuple[str, ...], list[str]]] = [
+  (('讲解视频', '生成视频', '做成视频', '视频讲解', '配音', r'重新合成', r'改.{0,6}解说'),
+   ['video_create', 'video_create_from_text', 'video_status', 'video_pages',
+    'video_update_page', 'video_update_pages', 'video_set_options', 'video_rerender']),
+  (('飞书群', '飞书消息', '飞书私聊', '飞书群成员'),
+   ['fetch_group_messages', 'fetch_p2p_messages', 'list_joined_chats', 'list_group_members']),
+  (('日常变更', '变更通知', '变更通报', '变更日报'), ['change_notice_report']),
+  (('关联告警', r'事件.{0,8}告警', r'告警.{0,8}关联'), ['event_alarm_link']),
+  (('合规审查', r'演练.{0,6}(合规|审查|检查)'), ['drill_compliance_audit']),
+  (('月度文档', r'文档.{0,4}(更新|检查|核对)'), ['doc_update_check']),
+  (('事件统计', '速报', '通报', r'班次.{0,6}统计', '群消息'),
+   ['incident_report', 'incident_progress', 'group_message_search']),
+  (('定时任务', r'每天.{0,4}点', r'每周.{0,4}点', r'每月.{0,4}号',
+    r'提醒我.{0,10}(每天|每周|每月|点|号|执行)'), ['schedule_task']),
+]
+
+
+def match_builtin_tools(message: str) -> list[str]:
+  """扫内置扩展桶，返回首个命中条目的工具名（有序去重）。
+
+  只返回工具名（不是 capability id）。命中多个桶时按 `_BUILTIN_QUERY_TOOLS` 的顺序
+  取第一个，保证确定性、避免跨桶串味；未命中返回空。
+  """
+  if not message:
+    return []
+  for patterns, names in _BUILTIN_QUERY_TOOLS:
+    if any(re.search(p, message, re.IGNORECASE) for p in patterns):
+      return list(dict.fromkeys(names))
+  return []
+
+
 async def build_initial_state(
   message: str,
   catalog_hash: str,
@@ -211,6 +265,7 @@ async def build_initial_state(
   task_mode: str = 'normal',
   web_search: bool = False,
   gated_names: tuple[str, ...] = (),
+  known_names: frozenset[str] | None = None,
 ) -> dict:
   """跑完整 Step1+Step2，产出 agent 的 initial_state（含预 promote）。
 
@@ -225,11 +280,13 @@ async def build_initial_state(
     gated_names: 模式门控工具名（web__search / web__fetch 等）。它们不在
       tool_search 的检索目录里，**只能**靠这里预 promote 才可见 —— 这是「联网工具
       只在调研模式可用」的正向放开那一半（负向在 manifest/intent_bindings/extra_hidden）。
+    known_names: 当前 deferred catalog 里的工具名集合（含内置扩展桶）。内置正则命中的
+      工具按它过滤——开关关掉/未注册的工具不预 promote，状态干净。
 
   Returns:
     initial_state dict；无预 promote 时为空 dict（agent 正常走 tool_search）。
   """
-  promoted = await _route(message, catalog_hash, history)
+  promoted = await _route(message, catalog_hash, history, known_names)
   names = list((promoted or {}).get('names') or [])
   gate_open = web_search or task_mode in MODE_GATED_TOOL_MODES
   if gate_open and gated_names:
@@ -243,8 +300,20 @@ async def build_initial_state(
   return {'promoted': {'catalog_hash': catalog_hash, 'names': names}}
 
 
-async def _route(message: str, catalog_hash: str, history: dict | None) -> dict | None:
-  """意图路由（Step1 常用表 → Step2 正则 → Step3 LLM plan），返回 promoted 或不含 names 的 dict。"""
+async def _route(
+  message: str,
+  catalog_hash: str,
+  history: dict | None,
+  known_names: frozenset[str] | None = None,
+) -> dict | None:
+  """意图路由（Step0 内置桶 → Step1 常用表 → Step2 正则 → Step3 LLM plan）。"""
+  # 0) 内置扩展桶正则：命中即独占返回（这些是确定性流水线，不混平台工具），首轮免 tool_search
+  builtin = match_builtin_tools(message)
+  if known_names is not None:
+    builtin = [n for n in builtin if n in known_names]
+  if builtin:
+    logger.info('route_to_tools(内置桶) → promote %d 工具 %s', len(builtin), builtin)
+    return {'catalog_hash': catalog_hash, 'names': builtin}
   # 1) 常用查询精准表：命中即只 promote 该查询要用的几个工具（含解析类），首轮直接可用
   caps = match_query_caps(message)
   if caps:

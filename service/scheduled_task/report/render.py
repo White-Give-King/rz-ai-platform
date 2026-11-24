@@ -437,13 +437,26 @@ def _r_equipment(ctx: _Ctx, no: int) -> str:
 
 
 def _r_dept(ctx: _Ctx, no: int) -> str:
-  """故障单专属：**故障部门分布与环比**（发散条形图 + 部门表）—— 事件单没有的维度。"""
+  """故障单专属：**故障部门分布与处置时长**（发散条形图 + 部门表）—— 事件单没有的维度。
+
+  表里带**本期 / 上期 P50**（处置时长）：只有两期都有 P50 才能判"恶化 / 改善"；
+  单期有效样本少于 3 单显示「—」。**不截断**（用户口径：列出全部 ≥3 单的部门）。
+  """
+  block = ctx.stats.get('dept') or {}
+  rows = block.get('rows') or []
+  min_n = block.get('min_n', 3)
+  rows = [r for r in rows
+          if (r.get('count') or 0) >= min_n or (r.get('prev') or 0) >= min_n]
   out = ctx.charts(no)
-  dept = (ctx.stats.get('dept') or {}).get('rows') or []
-  if dept:
-    out += _table(['部门', '本期单量', '上期单量', '环比增减'],
-                  [[r['name'], r['count'], r.get('prev', 0), _delta_text(r['delta'])]
-                   for r in dept[:10]])
+  if rows:
+    out += _table(
+      ['部门', '本期单量', '上期单量', '环比增减', '本期 P50', '本期 P90', '上期 P50'],
+      [[r['name'], r['count'], r.get('prev', 0), _delta_text(r['delta']),
+        _human_minutes(r.get('p50')), _human_minutes(r.get('p90')),
+        _human_minutes(r.get('prev_p50'))] for r in rows])
+    out += ('<p class="note">P50 / P90 为故障处理时长（故障发生→处理完成）；'
+            '单期有效样本少于 3 单的时长显示「—」，上期无同期数据也显示「—」，'
+            '此时不给趋势判断。</p>')
   return out + ctx.end(no)
 
 
@@ -555,15 +568,14 @@ def _alarm_link_block(link: dict) -> str:
   """重复类目下挂关联告警子表（事件单专属，数据来自 `details['alarm_links']`）。
 
   **全部关联上的类目都印**（不截断）；未关联的类目按逐次发生的判定原因分组计数，
-  不静默消失；全部没关联上时出一句覆盖说明，不出空表 ——
-  「未关联」不等于「没有告警」，措辞必须交代这一点。
+  不静默消失；全部没关联上时只出一句按原因计数的说明，不出空表。
   """
   from service.scheduled_task.report import alarm_link
 
   if not link:
     return ''
   if not link.get('available'):
-    reason = link.get('reason') or link.get('note') or ''
+    reason = link.get('reason') or ''
     return f'<p class="note">未关联到 DCIM 告警（{_e(reason)}）。</p>' if reason else ''
   clusters = [c for c in (link.get('clusters') or []) if isinstance(c, dict)]
   linked = [c for c in clusters if c.get('alarms')]
@@ -572,8 +584,8 @@ def _alarm_link_block(link: dict) -> str:
     dist = _reason_distribution(unlinked)
     if dist:
       return (f'<p class="note">本期 {len(unlinked)} 类重复问题均未关联到 DCIM 告警'
-              f'（{dist}）。{_e(link.get("note") or "")}</p>')
-    reason = link.get('reason') or link.get('note') or ''
+              f'（{dist}）。</p>')
+    reason = link.get('reason') or ''
     return f'<p class="note">未关联到 DCIM 告警（{_e(reason)}）。</p>'
   linked.sort(key=lambda c: int(c.get('count') or 0), reverse=True)
   out = ''
@@ -606,7 +618,6 @@ def _alarm_link_block(link: dict) -> str:
     # 未关联类目不再静默消失：按逐次发生的判定原因分组计数（一行 = 一次发生）
     out += (f'<p class="note">其余 {len(unlinked)} 类未关联'
             f'（{_reason_distribution(unlinked)}）。</p>')
-  out += f'<p class="note">{_e(link.get("note") or "")}</p>'
   return out
 
 

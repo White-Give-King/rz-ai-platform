@@ -33,8 +33,8 @@ def preset_cron(_key: str = KEY) -> str:
 
 def render_prompt(_key: str = KEY) -> str:
   """预设任务必填的指令字段。实际执行走确定性工作流，不消费这段文本。"""
-  return ('逐部门（A1…A18）在共享文档目录下按 25 条月度清单项取快照：'
-          '有月份目录的看本期应到月份有没有文件，无月份目录的比对 sha256；'
+  return ('逐部门（A1…A18 + B1M1/B1M2）在共享文档目录下按 25 条月度清单项取快照：'
+          '标「线上更新」的项比对 sha256，其余项查本期是否交了新文件；'
           '输出已更新 / 未更新 / 未找到 / 下载失败四项计数。')
 
 
@@ -60,7 +60,7 @@ async def ensure_doc_update_presets() -> list[str]:
       await repo.ensure_system_task(
         KEY,
         name=NAME,
-        description='各部门月度文档更新检查：25 条月度项 × A1…A18 部门',
+        description='各部门月度文档更新检查：25 条月度项 × 各公司各部门（含廊坊 B1M1/B1M2）',
         cron_expr=preset_cron(KEY),
         prompt=render_prompt(KEY),
         task_mode='normal',

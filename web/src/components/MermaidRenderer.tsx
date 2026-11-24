@@ -192,8 +192,10 @@ export default memo(function MermaidRenderer({ code }: { code: string }) {
               </button>
             </div>
           </div>
-          <div className="flex-1 overflow-auto p-6 flex items-center justify-center">
-            <div style={{ width: '100%', maxWidth: '1400px' }}>
+          {/* 不用 items-center：flex 居中 + overflow 会把高图顶部裁到滚不到的地方，
+              auto margin 在内容溢出时归 0，短图仍居中、高图能从顶部开始滚 */}
+          <div className="flex-1 overflow-auto p-6 flex justify-center">
+            <div className="my-auto" style={{ width: '100%', maxWidth: '1400px' }}>
               <div
                 dangerouslySetInnerHTML={{ __html: svg }}
                 className="flex justify-center [&>svg]:max-w-full [&>svg]:!w-full [&>svg]:h-auto"

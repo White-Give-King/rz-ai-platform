@@ -416,6 +416,138 @@
   background: var(--secondary);
 }
 
+/* ========== 思考中流光（文字扫光，替代三点跳动） ========== */
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    var(--muted-foreground) 0%,
+    var(--foreground) 50%,
+    var(--muted-foreground) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: rz-shimmer 1.6s linear infinite;
+}
+@keyframes rz-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-text {
+    animation: none;
+    background: none;
+    color: var(--muted-foreground);
+  }
+}
+
+/* ========== 不确定进度（文档检查遍历目录阶段） ==========
+   部门共享目录并发遍历要 8~10 分钟、步数不动；用滑动光带表示"在动"，
+   不显示会长时间停在 0% 的百分比。 */
+.rz-indeterminate::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 40%;
+  border-radius: 9999px;
+  background: var(--primary);
+  opacity: 0.65;
+  animation: rz-indeterminate 1.2s ease-in-out infinite;
+}
+@keyframes rz-indeterminate {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rz-indeterminate::after {
+    animation: none;
+    width: 100%;
+    opacity: 0.35;
+  }
+}
+
+/* ========== 代码高亮 token ==========
+   rehype-highlight 输出 .hljs-*；这里只按三套主题给语义色，不引入 highlight.js
+   自带主题（那套只认亮/暗单一模式，会与 .black 打架）。 */
+.hljs-comment,
+.hljs-quote,
+.hljs-meta {
+  color: var(--muted-foreground);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-built_in {
+  color: oklch(0.52 0.17 300);
+}
+.hljs-string,
+.hljs-attr-value,
+.hljs-regexp,
+.hljs-addition {
+  color: oklch(0.46 0.12 155);
+}
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet {
+  color: oklch(0.55 0.15 45);
+}
+.hljs-title,
+.hljs-section {
+  color: oklch(0.48 0.14 250);
+}
+.hljs-variable,
+.hljs-attr,
+.hljs-attribute {
+  color: oklch(0.5 0.1 200);
+}
+
+.dark .hljs-keyword,
+.dark .hljs-selector-tag,
+.dark .hljs-literal,
+.dark .hljs-built_in,
+.black .hljs-keyword,
+.black .hljs-selector-tag,
+.black .hljs-literal,
+.black .hljs-built_in {
+  color: oklch(0.78 0.12 300);
+}
+.dark .hljs-string,
+.dark .hljs-attr-value,
+.dark .hljs-regexp,
+.dark .hljs-addition,
+.black .hljs-string,
+.black .hljs-attr-value,
+.black .hljs-regexp,
+.black .hljs-addition {
+  color: oklch(0.78 0.1 155);
+}
+.dark .hljs-number,
+.dark .hljs-symbol,
+.dark .hljs-bullet,
+.black .hljs-number,
+.black .hljs-symbol,
+.black .hljs-bullet {
+  color: oklch(0.8 0.11 60);
+}
+.dark .hljs-title,
+.dark .hljs-section,
+.black .hljs-title,
+.black .hljs-section {
+  color: oklch(0.78 0.1 250);
+}
+.dark .hljs-variable,
+.dark .hljs-attr,
+.dark .hljs-attribute,
+.black .hljs-variable,
+.black .hljs-attr,
+.black .hljs-attribute {
+  color: oklch(0.78 0.08 200);
+}
+
 /* ========== 深色主题细节适配 ========== */
 .dark * { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 .dark ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -513,4 +645,23 @@
 }
 .rdp-root .rdp-outside {
   color: var(--muted-foreground);
+}
+
+/* ========== 合规检查详情看板外壳 ==========
+   始终让出平台顶栏（h-14）：面包屑与操作就在顶栏里，移动端也要可见。
+   桌面端再让出左侧导航；< lg 的侧边栏是抽屉，抽屉与遮罩仍在看板之上。
+   侧边栏宽度由 PlatformShell 写到 --rz-sidebar-w。 */
+.rz-board-overlay {
+  position: fixed;
+  top: 3.5rem;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* 低于平台顶栏（z-30），否则铃铛下拉会被看板盖住 */
+  z-index: 20;
+}
+@media (min-width: 1024px) {
+  .rz-board-overlay {
+    left: var(--rz-sidebar-w, 16rem);
+  }
 }

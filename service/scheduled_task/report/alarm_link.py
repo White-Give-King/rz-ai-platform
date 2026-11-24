@@ -2,15 +2,15 @@
 
 **为什么只能启发式匹配**：事件单（列表 + 详情）没有任何设备 / 点位 / guid 字段，
 能用的只有「发生时间 + 园区 + 部门 + 事件名称」；而 DCIM 告警是按测点推的。
-所以这里不追求「匹配上」，而是**不配优于配错**：时间窗先缩到 ±2 分钟，
-再用机房编码收敛，多候选交给模型仲裁，判不出就留空。
+所以这里不追求「匹配上」，而是**不配优于配错**：告警触发时间必须与事件发生时间
+**完全同秒**，再用机房编码收敛，多候选交给模型仲裁，判不出就留空。
 
-口径（用户 2026-10-30 确认，2026-11-02 改为全量 + 逐次发生）：
+口径（用户 2026-10-30 确认，2026-11-02 改为全量 + 逐次发生；2026-11-19 改为精确同秒）：
 
 - **全部重复类目都关联**（`stats['repeat']`，同一 `projectName` ≥2 次），不设类目数上限；
 - **每一次发生各搜一次**（代表单先搜；其余发生先复用代表单命中的点位签名，
-  没有签名时再按时间窗检索）；
-- 时间窗内命中多条时**由模型按地点 / 设备 / 测点 / 事件名称语义仲裁**，
+  没有签名时再按同秒检索）；
+- 同秒命中多条时**由模型按地点 / 设备 / 测点 / 事件名称语义仲裁**，
   **不要求字面完全相同**；判不出留空；每次歧义发生各自一次仲裁调用；
 - 展示**告警值**与该点位**四档阈值**（提示 / 一般 / 重要 / 紧急，未配置印 `—`）；
   **关联上的告警全部展示、不截断**（用户 2026-11-02 要求）。
@@ -21,7 +21,8 @@
 数据边界：
 
 - DCIM 告警当前只覆盖**廊坊**园区（`A` / `B1M1` / `B1M2` 集群），且自
-  `2026-10-29` 起才有数据 —— 更早的期次、其他园区一律关联不到，只出覆盖说明；
+  `2026-10-29` 起才有数据 —— 更早的期次、其他园区一律关联不到，只出一句按原因计数的说明
+  （`NOTE` 仅对话工具使用，报告不渲染）；
 - **库里的 `cluster` 是带园区前缀的代号**（`廊坊A` / `廊坊B1M1` / `廊坊B1M2`），
   按短码查 SQL 恒不命中（2026-11-02 生产实测：候选数全为 0）；
 - 全国口径的 `companyName` 是**法人主体**，要用 mgmt 公司档案的 `gardenName`
@@ -53,7 +54,6 @@ ALARM_COVERAGE_CLUSTER_SUFFIXES = ('A', 'B1M1', 'B1M2')
 # 传短码（`A`）SQL 恒不命中 —— 2026-11-02 生产实测：全国/园区报告候选数均为 0。
 ALARM_COVERAGE_CLUSTERS = tuple('廊坊' + s for s in ALARM_COVERAGE_CLUSTER_SUFFIXES)
 ALARM_COVERAGE_START = date(2026, 10, 29)
-TIME_WINDOW_SECONDS = 120
 LLM_MAX_CANDS = 8            # 交给模型仲裁的候选上限（按文本 Dice 降序）
 LLM_TIMEOUT = 15
 ALARM_QUERY_LIMIT = 200
@@ -75,7 +75,8 @@ _MAX_TOKENS = 300
 _SYSTEM = (
   '你是数据中心事件与动环告警的关联助手。用户会给出一条事件工单与若干条候选告警，'
   '请判断这条事件对应哪一条告警。\n'
-  '判断依据：地点（园区 / 楼宇 / 机房编码）、设备与测点、事件名称语义、发生时间接近程度。'
+  '候选告警的触发时间已与事件发生时间完全一致（同一秒），判断依据只剩'
+  '地点（园区 / 楼宇 / 机房编码）、设备与测点、事件名称语义。'
   '事件名称与告警内容不要求字面完全相同（例如「UPS 市电中断」与「A1 UPS 输出停电」可对应）。\n'
   '只能从候选中选，不得臆造；证据不足或无法判断时 pick 必须为 null。\n'
   '只输出 JSON：{"pick": <候选序号或 null>, "reason": "<不超过60字>"}'
@@ -387,17 +388,10 @@ def _alarm_text(alarm: dict) -> str:
                   ('device_name', 'point_name', 'content', 'space_name'))
 
 
-def _rank_candidates(cands: list[dict], text: str, ts: int) -> list[dict]:
-  """Dice 降序；保证时间最近的那条在列（它常常是文本最不像、但时间完全对上的）。"""
-  scored = sorted(cands, key=lambda a: (-_dice(text, _alarm_text(a)),
-                                        abs(int(a.get('alarm_time') or 0) - ts)))
-  top = scored[:LLM_MAX_CANDS]
-  if len(scored) > LLM_MAX_CANDS and scored:
-    nearest = min(cands, key=lambda a: abs(int(a.get('alarm_time') or 0) - ts))
-    key = (nearest.get('cluster'), nearest.get('event_log_id'))
-    if not any((a.get('cluster'), a.get('event_log_id')) == key for a in top):
-      top[-1] = nearest
-  return top
+def _rank_candidates(cands: list[dict], text: str) -> list[dict]:
+  """Dice 降序取前 `LLM_MAX_CANDS`（候选已限定在同一秒，不再按时间兜底）。"""
+  scored = sorted(cands, key=lambda a: -_dice(text, _alarm_text(a)))
+  return scored[:LLM_MAX_CANDS]
 
 
 def _narrow_by_room(cands: list[dict], codes: list[str]) -> list[dict]:
@@ -505,7 +499,6 @@ def build_prompt(event: dict, cands: list[dict]) -> tuple[str, str]:
     items.append({
       '序号': i,
       '触发时间': _fmt_time(cand.get('alarm_time')),
-      '与发生时间相差秒': int(cand.get('delta') or 0),
       '告警值': cand.get('alarm_value'),
       '空间名': cand.get('space_name') or '',
       '设备': cand.get('device_name') or '',
@@ -571,15 +564,14 @@ def _default_repo():
 
 
 def _query_alarms(repo, ts: int) -> list[dict]:
-  """±2 分钟候选，按**触发态时间**（历史表第一条 `status='1'`）。
+  """**精确同秒**候选（`ts..ts`），按**触发态时间**（历史表第一条 `status='1'`）。
 
   当前态 `alarm_time` 会被刷新(2)/恢复(3)推送覆盖，晚到的通报按当前态查会漏
   （事件统计表已改按触发时间，事件报告此前没改）。查询结果把 `alarm_time`
-  统一成 `trigger_ts`，下游算 `delta`、展示时间、给模型的「触发时间」都用它。
+  统一成 `trigger_ts`，下游展示时间、给模型的「触发时间」都用它。
   """
   rows = repo.find_alarms_by_trigger_time(
-    list(ALARM_COVERAGE_CLUSTERS), ts - TIME_WINDOW_SECONDS, ts + TIME_WINDOW_SECONDS,
-    limit=ALARM_QUERY_LIMIT,
+    list(ALARM_COVERAGE_CLUSTERS), ts, ts, limit=ALARM_QUERY_LIMIT,
   )
   out = []
   for row in rows or []:
@@ -587,7 +579,6 @@ def _query_alarms(repo, ts: int) -> list[dict]:
     trig = item.get('trigger_ts')
     if trig:
       item['alarm_time'] = int(trig)
-    item['delta'] = int(item.get('alarm_time') or 0) - ts
     out.append(item)
   return _dedupe(out)
 
@@ -688,17 +679,16 @@ async def _match_occurrence(rec: dict, meta: dict, ts: int | None, name: str,
   cands = _query_alarms(repo_get(), ts)
   cands = _narrow_by_room(cands, _room_codes(meta.get('dc'), name))
   if not cands:
-    return _verdict('no_alarm', reason='发生时间前后 2 分钟内没有告警')
+    return _verdict('no_alarm', reason='发生时间那一秒没有告警')
   if signature:                           # 复用代表单命中的点位：确定性选中，不调模型
     hit = [c for c in cands if _signature(c) == signature]
     if hit:
-      nearest = min(hit, key=lambda a: abs(int(a.get('alarm_time') or 0) - ts))
-      return _verdict('matched', 'point', '', alarm=nearest)
+      return _verdict('matched', 'point', '', alarm=hit[0])
   if len(cands) == 1:
     return _verdict('matched', 'time', '', alarm=cands[0])
 
   cands = _rank_candidates(
-    cands, f'{name} {_detail_text(details, meta.get("ticketNo"))}', ts)
+    cands, f'{name} {_detail_text(details, meta.get("ticketNo"))}')
   out['llm_calls'] += 1                   # 每次歧义发生各自一次仲裁
   try:
     idx, reason = await picker({
@@ -723,7 +713,7 @@ async def _link_plan(plan: dict, *, scope: str, park: str | None,
   """单个类目的全部发生：先查判定表，未命中才计算（逐次发生）。
 
   代表单（第一条）照旧走完整流程；其余发生优先复用**点位签名**（判定表里存的或
-  本次命中的都算，同一测点再次告警是确定性信号），没有签名时各按自己的时间窗检索。
+  本次命中的都算，同一测点再次告警是确定性信号），没有签名时各自按发生时间同秒检索。
   命中告警的**身份**收集到 `identities`，由调用方一次性补展示字段。
   """
   name, item = plan['name'], plan['item']
@@ -919,7 +909,7 @@ async def link_repeat_alarms(stats: dict, cur_recs: list[dict], details: dict,
   """重复类目 → 关联 DCIM 告警。**不抛异常**；`available=False` 表示数据源不可用。
 
   **遍历全部重复类目**（不截断），**每次发生先查判定表**：可复用就直接出结论；
-  未命中才查 ±`TIME_WINDOW_SECONDS` 候选（代表单先搜），单候选直接接受，
+  未命中才查**精确同秒**（发生时间那一秒）的候选（代表单先搜），单候选直接接受，
   多候选交 `picker` 仲裁（每次歧义发生各自一次调用），判完批量写回判定表。
 
   `store` 为 `alarm_decision.AlarmDecisionStore`（`None` 关闭判定表，测试默认关闭）；

@@ -30,3 +30,4 @@ data/
 deploy/vpn/
 # 页面截图/交互浏览的登录态（浏览器 storageState，含 Cookie；本地开发目录）
 deploy/browser_state/
+/docs/

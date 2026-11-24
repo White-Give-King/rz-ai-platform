@@ -3,6 +3,7 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from langchain_core.documents import Document
 import pandas as pd
@@ -520,13 +521,18 @@ def _load_pdf_cached(file_path: str) -> list[Document]:
 
 
 def _load_pdf_uncached(file_path: str) -> list[Document]:
-    """加载 PDF：优先本地 mineru-api，其次云端，再 CLI，失败降级 pypdf"""
+    """加载 PDF：本地 mineru-api → 本地 Gradio → 云端 → CLI，失败降级 pypdf"""
     if settings.MINERU_ENABLED:
         if settings.MINERU_LOCAL_API_URL:
             try:
                 return _load_pdf_mineru_local_api(file_path)
             except Exception as e:
                 logger.warning("MinerU 本地 API 解析失败，尝试其他方式: %s", e)
+        if settings.MINERU_GRADIO_URL:
+            try:
+                return _load_pdf_mineru_gradio(file_path)
+            except Exception as e:
+                logger.warning("MinerU 本地 Gradio 解析失败，尝试云端: %s", e)
         if settings.MINERU_API_BASE:
             try:
                 return _load_pdf_mineru_api(file_path)
@@ -636,7 +642,247 @@ def _load_pdf_mineru_local_api(file_path: str) -> list[Document]:
     return docs
 
 
-def _load_pdf_mineru_api(file_path: str) -> list[Document]:
+# Gradio 的 language 参数是长标签（不是 `ch`），取自官方 Gradio 服务的下拉选项。
+_GRADIO_LANG_LABELS = {
+    "ch": "ch (Chinese, English, Japanese, Chinese Traditional, Latin)",
+    "ch_server": "ch_server (Chinese, English, Japanese, Chinese Traditional, Latin)",
+    "korean": "korean (Korean, English)",
+    "ta": "ta (Tamil, English)",
+    "te": "te (Telugu, English)",
+    "ka": "ka (Kannada)",
+    "th": "th (Thai, English)",
+    "el": "el (Greek, English)",
+    "arabic": "arabic (Arabic, Persian, Uyghur, Urdu, Pashto, Kurdish, Sindhi, Balochi, English)",
+    "east_slavic": "east_slavic (Russian, Belarusian, Ukrainian, English)",
+    "cyrillic": (
+        "cyrillic (Russian, Belarusian, Ukrainian, Serbian (Cyrillic), Bulgarian, Mongolian, "
+        "Abkhazian, Adyghe, Kabardian, Avar, Dargin, Ingush, Chechen, Lak, Lezgin, Tabasaran, "
+        "Kazakh, Kyrgyz, Tajik, Macedonian, Tatar, Chuvash, Bashkir, Malian, Moldovan, Udmurt, "
+        "Komi, Ossetian, Buryat, Kalmyk, Tuvan, Sakha, Karakalpak, English)"
+    ),
+    "devanagari": (
+        "devanagari (Hindi, Marathi, Nepali, Bihari, Maithili, Angika, Bhojpuri, Magahi, "
+        "Santali, Newari, Konkani, Sanskrit, Haryanvi, English)"
+    ),
+}
+
+# 同步版计数信号量（DistributedSemaphore 是 redis.asyncio，而 loader 是同步函数）。
+_SLOT_ACQUIRE_LUA = """
+local cur = redis.call('GET', KEYS[1]) or 0
+if tonumber(cur) < tonumber(ARGV[1]) then
+  redis.call('INCR', KEYS[1])
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+  return 1
+end
+return 0
+"""
+
+
+def _mineru_gradio_lang() -> str:
+    """MINERU_LANG（ch / zh / 长标签）→ Gradio 的 language 长标签。"""
+    raw = (settings.MINERU_LANG or "ch").strip()
+    if raw == "zh":
+        raw = "ch"
+    if raw in _GRADIO_LANG_LABELS:
+        return _GRADIO_LANG_LABELS[raw]
+    if "(" in raw:  # 已是长标签，原样透传
+        return raw
+    return _GRADIO_LANG_LABELS["ch"]
+
+
+@contextmanager
+def _mineru_gradio_slot():
+    """跨进程并发闸（Redis 计数），Redis 不可用时 fail-open 直接放行。
+
+    实测 Gradio 服务端约只支持 3 路并行，4 路起排队；生产 `--workers 4`
+    下进程内信号量会变成 4×3，故必须走 Redis。租约 TTL 让被 kill 的 worker
+    漏掉的槽位自愈。
+    """
+    import time
+
+    limit = int(settings.MINERU_GRADIO_CONCURRENCY or 0)
+    if limit <= 0:
+        yield
+        return
+    try:
+        from config.redis_conn import redis_manager
+
+        client = redis_manager.client
+        key = redis_manager.key("mineru:gradio:slots")
+        acquire = client.register_script(_SLOT_ACQUIRE_LUA)
+        ttl = max(120, int(settings.MINERU_GRADIO_TIMEOUT or 300) + 60)
+    except Exception as e:
+        logger.warning("MinerU Gradio 并发闸不可用（fail-open）: %s", e)
+        yield
+        return
+
+    held = False
+    try:
+        while True:
+            try:
+                if acquire(keys=[key], args=[limit, ttl]) == 1:
+                    held = True
+                    break
+            except Exception as e:
+                logger.warning("MinerU Gradio 槽位获取失败（fail-open）: %s", e)
+                break
+            time.sleep(0.2)
+        yield
+    finally:
+        if held:
+            try:
+                client.decr(key)
+            except Exception as e:
+                logger.warning("MinerU Gradio 槽位释放失败（待 TTL 自愈）: %s", e)
+
+
+def _load_pdf_mineru_gradio(
+    file_path: str,
+    *,
+    is_ocr: bool | None = None,
+) -> list[Document]:
+    """通过现场自建的 MinerU Gradio 服务解析 PDF（raw REST，不引 gradio_client）。
+
+    流程：upload → FileData → call/convert_to_markdown_stream → SSE complete →
+    取 md_text（**不用 content_list**：其中表格字段是 table_body，现有解析器读
+    text 会丢表）。md 含图片引用时再下结果 zip 解出 images/，复用
+    `_process_markdown_images`。失败抛异常，由调用方继续降级。
+    """
+    import io
+    import time
+    import zipfile
+    import requests
+
+    base = settings.MINERU_GRADIO_URL.rstrip("/")
+    if not base:
+        raise RuntimeError("MINERU_GRADIO_URL 未配置")
+    file_name = Path(file_path).name
+    file_size = Path(file_path).stat().st_size
+    backend = settings.MINERU_GRADIO_BACKEND or "vlm-engine"
+    timeout = int(settings.MINERU_GRADIO_TIMEOUT or 300)
+
+    logger.info(
+        "MinerU Gradio 开始解析: %s (%.1f MB) -> %s backend=%s is_ocr=%s",
+        file_name, file_size / 1024 / 1024, base, backend, is_ocr,
+    )
+
+    with _mineru_gradio_slot(), requests.Session() as session:
+        with open(file_path, "rb") as fh:
+            up = session.post(
+                f"{base}/gradio_api/upload",
+                files=[("files", (file_name, fh, "application/pdf"))],
+                timeout=120,
+            )
+        if up.status_code != 200:
+            raise RuntimeError(f"Gradio 上传失败: HTTP {up.status_code} {up.text[:200]}")
+        server_paths = up.json()
+        if not server_paths:
+            raise RuntimeError("Gradio 上传未返回服务器路径")
+
+        file_data = {
+            "path": server_paths[0],
+            "orig_name": file_name,
+            "meta": {"_type": "gradio.FileData"},
+            "_type": "gradio.FileData",
+        }
+        body = {"data": [
+            file_data, 1000, bool(is_ocr), True, True, True, "medium",
+            _mineru_gradio_lang(), backend, "http://localhost:30000",
+        ]}
+        started = session.post(
+            f"{base}/gradio_api/call/convert_to_markdown_stream",
+            json=body, timeout=60,
+        )
+        if started.status_code != 200:
+            raise RuntimeError(
+                f"Gradio 调用失败: HTTP {started.status_code} {started.text[:200]}"
+            )
+        event_id = started.json().get("event_id")
+        if not event_id:
+            raise RuntimeError("Gradio 未返回 event_id")
+
+        deadline = time.monotonic() + timeout
+        event, data, complete, error = "", [], None, None
+        with session.get(
+            f"{base}/gradio_api/call/convert_to_markdown_stream/{event_id}",
+            headers={"Accept": "text/event-stream"},
+            stream=True,
+            timeout=(15, timeout),
+        ) as resp:
+            if resp.status_code != 200:
+                raise RuntimeError(f"Gradio SSE 失败: HTTP {resp.status_code}")
+            for raw in resp.iter_lines(decode_unicode=True):
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f"Gradio 解析超时 ({timeout}s)")
+                if raw is None:
+                    continue
+                if raw == "":
+                    if event == "complete" and complete is None:
+                        complete = "\n".join(data)
+                    elif event == "error" and error is None:
+                        error = "\n".join(data)
+                    event, data = "", []
+                    if complete is not None or error is not None:
+                        break
+                    continue
+                if raw.startswith("event:"):
+                    event = raw[6:].strip()
+                elif raw.startswith("data:"):
+                    data.append(raw[5:].lstrip())
+        if complete is None and event == "complete":
+            complete = "\n".join(data)
+        if complete is None:
+            raise RuntimeError(f"Gradio 未返回 complete 事件: {(error or '无错误信息')[:300]}")
+
+        payload = json.loads(complete)
+        md_text = payload[3] if len(payload) > 3 else ""
+        zip_info = payload[1] if len(payload) > 1 else None
+        if not md_text:
+            raise RuntimeError("Gradio 返回的 md_text 为空")
+
+        with tempfile.TemporaryDirectory(prefix="mineru_gradio_") as tmpdir:
+            md_dir = Path(tmpdir)
+            if re.search(r"!\[.*?\]\(images/", md_text):
+                zip_url = ""
+                if isinstance(zip_info, dict):
+                    zip_url = zip_info.get("url") or ""
+                if not zip_url:
+                    raise RuntimeError("Gradio markdown 含图片但未返回结果 zip")
+                zr = session.get(zip_url, timeout=180)
+                zr.raise_for_status()
+                with zipfile.ZipFile(io.BytesIO(zr.content)) as zf:
+                    zf.extractall(md_dir)
+
+            _debug_dir = Path(settings.UPLOAD_DIR).parent / "debug_mineru_output"
+            _debug_dir.mkdir(exist_ok=True)
+            _debug_stem = Path(file_path).stem
+            (_debug_dir / f"{_debug_stem}_01_raw.md").write_text(md_text, encoding="utf-8")
+
+            processed_md = _process_markdown_images(md_text, md_dir=md_dir)
+            (_debug_dir / f"{_debug_stem}_02_processed.md").write_text(
+                processed_md, encoding="utf-8"
+            )
+            cleaned = clean_text(processed_md)
+            (_debug_dir / f"{_debug_stem}_03_cleaned.md").write_text(
+                cleaned, encoding="utf-8"
+            )
+
+    docs = [Document(
+        page_content=cleaned,
+        metadata={"source": file_path, "parser": "mineru_gradio"},
+    )]
+    logger.info(
+        "MinerU Gradio 解析完成: %s → markdown %d chars", file_name, len(cleaned),
+    )
+    return docs
+
+
+def _load_pdf_mineru_api(
+    file_path: str,
+    *,
+    is_ocr: bool | None = None,
+    language: str | None = None,
+) -> list[Document]:
     """通过 MinerU v4 API 解析 PDF（无需本地 CLI）。
 
     流程：
@@ -646,6 +892,10 @@ def _load_pdf_mineru_api(file_path: str) -> list[Document]:
       4. 下载 full_zip_url → 解压 → 解析 content_list + images/
 
     要求：MINERU_API_BASE 和 MINERU_API_TOKEN 均需在 .env 中配置。
+
+    `is_ocr` / `language` 只在**非 None** 时写进 batch 请求体 —— 不传即保持既往
+    行为逐字不变（RAG 摄入路径不受影响）。扫描件（如演练记录 PDF）需显式开 OCR：
+    `is_ocr=True, language='ch'`（仅对 pipeline / vlm 模型有效）。
     """
     import requests
     import time
@@ -665,15 +915,20 @@ def _load_pdf_mineru_api(file_path: str) -> list[Document]:
     )
 
     # —— Step 1: 申请上传 URL ——
+    batch_payload = {
+        "files": [{"name": file_name}],
+        "model_version": "vlm",
+        "return_images": "true",
+        "image_extract": "true",
+        "no_cache": "true",
+    }
+    if is_ocr is not None:
+        batch_payload["is_ocr"] = is_ocr
+    if language is not None:
+        batch_payload["language"] = language
     batch_resp = requests.post(
         f"{api_base}/api/v4/file-urls/batch",
-        json={
-            "files": [{"name": file_name}],
-            "model_version": "vlm",
-            "return_images": "true",
-            "image_extract": "true",
-            "no_cache": "true",
-        },
+        json=batch_payload,
         headers=headers,
         timeout=30,
     )

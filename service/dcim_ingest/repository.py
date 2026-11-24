@@ -994,9 +994,9 @@ class DcimRepository:
     """按**触发态时间**查候选告警，返回行带 `trigger_ts`（秒级）。
 
     当前态 `alarm_time`/`alarm_value` 会被刷新(2)/恢复(3)推送覆盖（`apply_batch`
-    整行 upsert），晚到的通报按 ±120s 查当前态会漏掉对应告警。优先读历史表第一条
+    整行 upsert），晚到的通报按当前态查会漏掉对应告警。优先读历史表第一条
     `status='1'` 的 `payload->>'timestamp'`；没有历史行的老告警回退当前态 `alarm_time`
-    （与原查询逐行等价）。`trigger_ts` 供调用方算 `delta` 与展示时间。
+    （与原查询逐行等价）。`trigger_ts` 供调用方展示时间与同秒比对。
     """
     cluster_list = [clusters] if isinstance(clusters, str) else list(clusters or [])
     cluster_list = [c for c in cluster_list if c]

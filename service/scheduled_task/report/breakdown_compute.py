@@ -50,6 +50,8 @@ _DUR_BIN_LABELS = ['<15分', '15-30分', '30-60分', '1-2时', '2-4时',
 _HEATMAP_MAX_DC = 12
 # 帕累托图取前 N 类设备
 _PARETO_TOP = 10
+# 部门时长分位的最小样本：单期有效样本更少的部门不出 P50/P90（也不判趋势）
+_DEPT_MIN_N = 3
 
 
 def _parse_ms(series: pd.Series) -> list:
@@ -62,6 +64,30 @@ def _parse_ms(series: pd.Series) -> list:
       out.append(None)
       continue
     out.append(ms / 60000.0 if ms > 0 else None)
+  return out
+
+
+def _dept_duration(frame: pd.DataFrame, minutes: list) -> dict:
+  """按部门（`dc`）统计处理时长分位：单期有效样本 < `_DEPT_MIN_N` 的不给值。
+
+  `minutes` 必须与 `frame` 行对齐（同源 `faultHandlingTime` 解析结果）；长度不符直接返回空，
+  不猜。返回 `{部门名: {'n': 有效样本, 'p50': 分钟, 'p90': 分钟}}`。
+  """
+  if frame is None or 'dc' not in frame.columns or not len(frame):
+    return {}
+  if not minutes or len(minutes) != len(frame):
+    return {}
+  df = pd.DataFrame({'dc': frame['dc'].astype(str).str.strip(), 'm': minutes})
+  df = df[~df['dc'].isin(('', 'nan', 'None'))].dropna(subset=['m'])
+  if df.empty:
+    return {}
+  out = {}
+  for name, g in df.groupby('dc')['m']:
+    if len(g) < _DEPT_MIN_N:
+      continue
+    out[str(name)] = {'n': int(len(g)),
+                      'p50': round(float(g.quantile(.5)), 1),
+                      'p90': round(float(g.quantile(.9)), 1)}
   return out
 
 
@@ -173,10 +199,17 @@ def compute_stats(df_cur: pd.DataFrame, df_prev: pd.DataFrame, window: dict) -> 
         for i, v in enumerate(col):
           park_level['matrix'][i].append(v)
 
-  # 故障部门分布（按 `dc` 部门/分部，已解析成中文名）+ 环比增减（本期−上期）。
+  # 故障部门分布（按 `dc` 部门/分部，已解析成中文名）+ 环比增减（本期−上期）
+  # **+ 处置时长 P50/P90（本期与上一期同口径）**。
   # ⚠️ 不用 `occurrenceSite`：那是手写自由文本、**每单唯一**（实测 56 单 → 56 个地点、计数全为 1），
   # 做成 "Top10" 只会任取 10 个并列 1 的字符串，零信息量。部门才是能聚合的位置维度。
-  dept = {'rows': [], 'classes': 0}
+  # 时长口径：两期都从 `faultHandlingTime` 独立解析（df_prev 已取全量，不需要额外取数）——
+  # 只有两期都有 P50 才给 `p50_delta`，否则 None：缺上期数据就不能判"恶化/改善"。
+  cur_minutes = (_parse_ms(df_cur['faultHandlingTime'])
+                 if 'faultHandlingTime' in df_cur.columns else [])
+  prev_minutes = (_parse_ms(df_prev['faultHandlingTime'])
+                  if 'faultHandlingTime' in df_prev.columns else [])
+  dept = {'rows': [], 'classes': 0, 'min_n': _DEPT_MIN_N}
   if 'dc' in df_cur.columns:
     def _dc_counts(frame):
       if 'dc' not in frame.columns:
@@ -185,15 +218,26 @@ def compute_stats(df_cur: pd.DataFrame, df_prev: pd.DataFrame, window: dict) -> 
       s = s[~s.isin(['', 'nan', 'None'])]
       return {str(k): int(v) for k, v in s.value_counts().items()}
     cur_dc, prev_dc = _dc_counts(df_cur), _dc_counts(df_prev)
+    cur_dur = _dept_duration(df_cur, cur_minutes)
+    prev_dur = _dept_duration(df_prev, prev_minutes)
     # 键取并集：本期归零的部门（上期有、本期 0）也要出现，否则发散条形看不见"下降"
     keys = list(dict.fromkeys([*cur_dc.keys(), *prev_dc.keys()]))
-    rows = [{'name': k, 'count': cur_dc.get(k, 0), 'prev': prev_dc.get(k, 0),
-             'delta': cur_dc.get(k, 0) - prev_dc.get(k, 0),
-             'pct': _pct(cur_dc.get(k, 0), total)}
-            for k in keys]
+    rows = []
+    for k in keys:
+      cd, pdur = cur_dur.get(k) or {}, prev_dur.get(k) or {}
+      p50, prev_p50 = cd.get('p50'), pdur.get('p50')
+      rows.append({
+        'name': k, 'count': cur_dc.get(k, 0), 'prev': prev_dc.get(k, 0),
+        'delta': cur_dc.get(k, 0) - prev_dc.get(k, 0),
+        'pct': _pct(cur_dc.get(k, 0), total),
+        'n_valid': cd.get('n', 0),
+        'p50': p50, 'p90': cd.get('p90'), 'prev_p50': prev_p50,
+        'p50_delta': (round(p50 - prev_p50, 1)
+                      if p50 is not None and prev_p50 is not None else None),
+      })
     rows.sort(key=lambda r: (-r['count'], r['name']))
     _add_compare(rows, prev_total)
-    dept = {'rows': rows, 'classes': len(rows)}
+    dept = {'rows': rows, 'classes': len(rows), 'min_n': _DEPT_MIN_N}
 
   # 设备类型（故障单标志性维度）：全部计数 + 帕累托前 N
   equip = (df_cur['breakdownEquipmentType'].astype(str).value_counts()
@@ -210,7 +254,7 @@ def compute_stats(df_cur: pd.DataFrame, df_prev: pd.DataFrame, window: dict) -> 
 
   # ---- 处理时效（**故障处理时长** faultHandlingTime，毫秒）----
   # 与事件单同构地放进 `accept` 槽位：渲染层只差"标签"，结构与表格形状完全一致
-  minutes = _parse_ms(df_cur['faultHandlingTime']) if 'faultHandlingTime' in df_cur.columns else []
+  minutes = cur_minutes                       # 已在部门块处解析（同一份数据）
   acc_minutes, _ = _parse_accept(df_cur)      # 验收时长（同一列 checkEndApprove）
   valid = [m for m in minutes if m is not None]
   accept = {'available': bool(valid), 'valid': len(valid), 'rows': total}

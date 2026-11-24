@@ -176,7 +176,7 @@ async def _check_task(task: dict, dept: dict, *, created_by: str, refresh: bool,
     hit = cached.get(dev['device_id']) if dev['device_id'] else None
     if hit and hit.get('label'):
       judgement, note = verdict.classify(hit.get('label') or '', '')
-      row.update(判定=judgement, 模型分数='' if hit.get('score') is None
+      row.update(判定=judgement, 置信度='' if hit.get('score') is None
                  else str(hit.get('score')), 说明=note)
       hits.append(dev)
       rows.append(row)
@@ -231,7 +231,7 @@ async def _check_task(task: dict, dept: dict, *, created_by: str, refresh: bool,
         judgement, note = verdict.classify(hit.get('label') or '', hit.get('error') or '')
         p['row'].update(
           判定=judgement,
-          模型分数='' if hit.get('score') is None else str(hit.get('score')),
+          置信度='' if hit.get('score') is None else str(hit.get('score')),
           说明=note,
         )
         predicted[p['dev']['device_id']] = hit
@@ -410,6 +410,9 @@ async def records_for(run_id: str = '', task_id: str = '') -> dict:
   out: list[dict] = []
   for i, r in enumerate(rows):
     row = dict(r, 序号=i + 1)
+    # 历史行以旧列名「模型分数」落库，读时映射到新列名「置信度」（不重跑检测即可见）
+    if '置信度' not in row and '模型分数' in row:
+      row['置信度'] = row.pop('模型分数')
     local = _local_image_url(str(row.get('巡检任务') or ''), str(row.get('_image') or ''))
     if local:
       row['图片链接'] = local

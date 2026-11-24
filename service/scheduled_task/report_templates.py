@@ -11,8 +11,8 @@
 - 时间：`weekly`（周报）／`monthly`（月报）
 **园区不写死在代码里**：启动时从平台数据发现（`_list_pen_companies` 的可见公司 + `query_company_list`
 的 `gardenName`），当前 5 个国内园区（廊坊/平湖/惠州/佛山/重庆）+ 全国 → 5 × 6 × 2 = 60 条；
-问题单量太少，只出「全国 · 月度」→ 实际 **49 条**（`TICKETS` 条目的 `periods` 限制周期、
-`national_only` 跳过园区）。
+问题单量太少，只出「全国 · 月度」→ 49 条（`TICKETS` 条目的 `periods` 限制周期、`national_only`
+跳过园区）。另加一条**变更通知合规周报**（`changenotice`，全国 · 每周，走专用工作流）→ 实际共 **50 条**。
 加类型/加园区都只是数据变化，代码只认 `TICKETS` 这张表。
 
 三个设计要点：
@@ -54,6 +54,12 @@ TICKETS: tuple[dict, ...] = (
    'dims': '**事件级别**、专业分布'},
   {'id': 'threshold', 'name': '阈值工单', 'capability': 'mgmt.query_threshold_ticket',
    'dims': '专业分布、阶段（进度）分布'},
+  # 变更通知合规周报：数据来自本地 PG（群消息 `dcim_change_reports`），**不是 mgmt 工单**，
+  # 走专用确定性工作流 `change_notice/weekly_report.py`（runner 按 `changenotice__` 前缀早分支，
+  # 这里渲染的 prompt 永不执行）。`capability: ''` 只为占位，`national_only` 全国合并成一张表。
+  # 只出周报（合规按自然周看）。
+  {'id': 'changenotice', 'name': '变更通知合规', 'capability': '',
+   'dims': '合规率、违规规则分布、园区分布', 'periods': ('weekly',), 'national_only': True},
   # 供应商服务工单**暂不出报告**：列表接口无时间筛选、确定性 ReportSpec 未实现，
   # 只能走老 agent 路径且口径不清。`periods: ()` → 不生成预设 key，启动时
   # `disable_stale_system_tasks()` 把库里已有的 supplier 预设停用（不删除，可恢复）。
@@ -425,6 +431,22 @@ async def _ensure_preset_tasks_inner() -> list[str]:
 
     if doc_update_presets.enabled():
       exclude += (doc_update_presets.PREFIX,)
+  except Exception:
+    pass
+  # 应急演练周审查预设（`drill_audit__`）同理。
+  try:
+    from service.drill_audit import presets as drill_audit_presets
+
+    if drill_audit_presets.enabled():
+      exclude += (drill_audit_presets.PREFIX,)
+  except Exception:
+    pass
+  # 每日变更统计预设（`change_notice__`）同理。
+  try:
+    from service.scheduled_task.change_notice import presets as change_notice_presets
+
+    if change_notice_presets.enabled():
+      exclude += (change_notice_presets.PREFIX,)
   except Exception:
     pass
   # 清单为空说明代码侧出了岔子（正常情况下至少有全国 9 条）——此时绝不能当成

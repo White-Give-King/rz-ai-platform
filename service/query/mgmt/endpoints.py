@@ -1,10 +1,8 @@
 """综合管理平台真实接口的声明式映射（method/path/参数位置/取值路径）。
 
-35 条 EndpointSpec（与 capabilities.py 的 43 条能力对应：35 条单接口一一映射，
-另 8 条 query_pending_ticket / query_change_ticket / query_breakdown_ticket /
-query_question_ticket / query_breakdown_ticket_detail / query_question_ticket_detail
-/ query_event_ticket_detail / query_change_ticket_detail 为组合能力，无
-EndpointSpec，走 client.call 特判）：
+38 条 EndpointSpec（与 capabilities.py 的 56 条能力对应：38 条单接口一一映射，
+其余 18 条（pending / 五类工单列表与详情组合、变更统计、维护流程、演练计划等）为组合能力，
+无 EndpointSpec，走 client.call 特判）：
 - query_person_by_name：GET /user/info/v2/{name}，data 即用户对象数组，原样返回。
 - query_person_by_id：POST /user/records/v2，body {uid,deptId,companyId}，
   result_path 取 user；deptId/companyId 走服务账号默认上下文兜底。
@@ -133,6 +131,12 @@ EndpointSpec，走 client.call 特判）：
 - query_review_appointment_detail：GET /review_appointments/detail/v1/{id}，id 在
   path 占位符（appointment_id 经 param_map 反查填充，同 query_mindmap）。data 即
   单条评审预约完整详情对象，原样返回，无分页。
+- query_drill_plans：组合能力，见 `client._query_drill_plans`：GET /drill/plan/list/v1，
+  query {deptId,year}，可选 month 按 weeks[].month 过滤（避免全年约 50 周把载荷撑过
+  工具输出上限、末尾计划被整条截断）。
+- query_drill_week：GET /drill/plan/week/v1/{week_id}，week_id 在 path 占位符
+  （同名直接填充），data 即单周明细（含 A/B/C/D 班组文件字段，小写前缀
+  agroupFileId…dgroupFileName），原样返回，无分页。
 
 其余接口（部门树/隐患/周报等）已移除。`client.py` 只做「查 EndpointSpec →
 组装请求 → 调 http.request → 按 result_path 摘取」，不含任何接口相关的硬编码逻辑，
@@ -299,6 +303,7 @@ ENDPOINTS: dict[str, EndpointSpec] = {
   # type=1 计划巡检 / 0 非计划巡检；archive 固定 true 只查已归档。响应 {total, list}。
   'mgmt.query_inspection_list': EndpointSpec(
     method='POST',
+
     path='/inspection/inspection/search/v1',
     base_url=settings.MGMT_INSPECTION_BASE_URL,
     param_location='json',
@@ -697,6 +702,7 @@ ENDPOINTS: dict[str, EndpointSpec] = {
     defaults={'companyId': 'company_id'},
     result_path='',  # data 即部门数组，原样返回
   ),
+
   # query_mindmap（实测）：GET /file/v1/getAll/{id}，id 在 path 占位符（file_id 经
   # param_map 反查填充，同 query_dept_by_name/query_device_group）。data 即思维导图
   # 树对象（根 + 多级 children，type=1 分类节点 / type=0 文件节点），原样返回，无分页。
@@ -805,6 +811,16 @@ ENDPOINTS: dict[str, EndpointSpec] = {
     path='/review_appointments/detail/v1/{id}',
     param_location='query',
     param_map={'appointment_id': 'id'},
+    page_style='none',
+    result_path='',
+  ),
+  # query_drill_week：GET /drill/plan/week/v1/{week_id}，week_id 在 path 占位符
+  # （同名直接填充，无需 param_map）。data 即单周明细对象（含 A/B/C/D 班组文件字段，
+  # 小写前缀 agroupFileId…dgroupFileName），原样返回，无分页。
+  'mgmt.query_drill_week': EndpointSpec(
+    method='GET',
+    path='/drill/plan/week/v1/{week_id}',
+    param_location='query',
     page_style='none',
     result_path='',
   ),

@@ -7,9 +7,10 @@
 import asyncio
 import mimetypes
 import re
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from core.rbac import require_permission
 from models.rag.message_models import MessageListResponse
@@ -847,7 +848,7 @@ async def download_incident_artifact(run_id: str, filename: str, request: Reques
 
 
 # ==================== 文档更新检查（部门 × 25 项 · 共享只读）====================
-# 逐部门（A1…A18）共享文档检查 25 条月度项（口径见 service/doc_update）。读数不下载；
+# 逐部门（廊坊 A1…A18 + B1M1/B1M2 等）共享文档检查 25 条月度项（口径见 service/doc_update）。读数不下载；
 # 「立即检查」才真的去取一期（5~15 分钟），用 Redis 租约防重复触发（见 sync_state）。
 def _doc_update_progress() -> dict | None:
   from service.doc_update import sync_state
@@ -904,20 +905,67 @@ async def get_doc_update_overview(
 @router.post('/doc-update/sync')
 @require_permission('ai:agent')
 async def trigger_doc_update_sync(request: Request):
-  """后台跑一期快照（约 5~15 分钟）；已在跑则 `started=false`，不排队。"""
-  from service.doc_update import presets, sync_state, workflow
+  """后台跑一期快照；已在跑则 `started=false`，不排队。
+
+  body 可选 `{company_id, dept_name}`：只查该部门（其余部门沿用本期已有结果）。
+  `{period: 'YYYY-MM', force?}`：补跑历史期（只支持部门口径；该期已有快照需 `force`）。
+  都不传＝当期全部部门一起查。
+  """
+  from service.doc_update import depts, period as period_mod, presets, store
+  from service.doc_update import sync_state, workflow
 
   if not presets.enabled():
     raise HTTPException(400, '文档更新检查未开启（DOC_UPDATE_CHECK_ENABLED=false）')
 
   user_id = getattr(request.state, 'user_id', '') or ''
+  try:
+    body = await request.json()
+  except Exception:  # noqa: BLE001  无 body / 非 JSON 一律按「查全部」
+    body = None
+
+  target = ''
+  force = False
+  if isinstance(body, dict):
+    target = str(body.get('period') or '').strip()
+    force = bool(body.get('force'))
+  if target:
+    # 校验放在取租约之前：非法目标期直接 400，不让用户等一轮后台任务才发现
+    if not workflow.is_dept_scope():
+      raise HTTPException(400, '补跑历史期只支持部门口径（DOC_UPDATE_SCOPE=dept）')
+    exists = await store.same_period(target) is not None
+    err = period_mod.check_target_period(
+      target, workflow.period_key(), exists and not force)
+    if err:
+      raise HTTPException(400, err)
+
+  kwargs: dict = {'period': target or None, 'force': force}
+  dept_label = ''
+  if isinstance(body, dict) and (body.get('company_id') or body.get('dept_name')):
+    cid = str(body.get('company_id') or '').strip()
+    name = str(body.get('dept_name') or '').strip().upper()
+    hit = next(
+      (c for c in await depts.dept_columns()
+       if (not cid or c.get('company_id') == cid)
+       and str(c.get('dept_name') or '').upper() == name),
+      None,
+    )
+    if not hit:
+      raise HTTPException(400, '未找到该部门（不在 DOC_UPDATE_DEPTS 固定清单里）')
+    kwargs.update({'dept_names': [hit['dept_name']],
+                   'companies': [hit['company_id']]})
+    dept_label = f"{hit.get('company_name') or ''} · {hit['dept_name']}".strip(' ·')
+
   lease = sync_state.acquire('manual', user_id)
   if lease is None:
     return {'ok': True, 'data': {'started': False, 'reason': '已有一次检查在跑'}}
 
   async def _run():
     try:
-      await workflow.perform_sync(created_by=user_id, progress=lease.update)
+      await workflow.perform_sync(created_by=user_id, progress=lease.update, **kwargs)
+    except sync_state.SyncCancelled:
+      # 用户终止：不是失败，快照整体不落库（store.save 在冒泡路径之后）
+      import logging
+      logging.getLogger(__name__).info('文档更新检查已被用户终止（本轮结果未保存）')
     except Exception as e:  # noqa: BLE001  后台任务失败只记日志，页面靠轮询看结果
       import logging
       logging.getLogger(__name__).warning('文档更新检查手动同步失败: %s', e)
@@ -925,7 +973,53 @@ async def trigger_doc_update_sync(request: Request):
       lease.release()
 
   asyncio.create_task(_run())
-  return {'ok': True, 'data': {'started': True}}
+  return {'ok': True, 'data': {
+    'started': True, 'scope': 'dept' if dept_label else 'all', 'dept': dept_label,
+    'period': target,
+  }}
+
+
+@router.post('/doc-update/cancel')
+@require_permission('ai:agent')
+async def cancel_doc_update_sync(request: Request):
+  """请求终止当前检查：写取消旗标，正在跑的 worker 在下一个进度点停下。
+
+  生产是多 worker，取消请求可能落到别的进程，故走 Redis 旗标而非 `Task.cancel()`。
+  """
+  from service.doc_update import presets, sync_state
+
+  if not presets.enabled():
+    raise HTTPException(400, '文档更新检查未开启（DOC_UPDATE_CHECK_ENABLED=false）')
+
+  cancelling = sync_state.request_cancel()
+  return {'ok': True, 'data': {
+    'cancelling': cancelling,
+    'reason': '' if cancelling else '当前没有正在跑的检查',
+  }}
+
+
+_SCREENSHOT_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+@router.get('/doc-update/screenshots/{name}')
+@require_permission('ai:agent')
+async def get_doc_update_screenshot(name: str):
+  """未找到项的目录截图（同步时自动截的那一张，见 `service/doc_update/screenshot.py`）。
+
+  文件名是纯 ASCII（`docupd-<hash>-<时间戳>.png`）：白名单 + `resolve()` 后必须仍在
+  截图目录内，防路径穿越。
+  """
+  from pathlib import Path
+
+  from config.settings import settings
+
+  if not _SCREENSHOT_NAME_RE.match(name):
+    raise HTTPException(400, '非法文件名')
+  base = Path(settings.DOC_UPDATE_SCREENSHOT_DIR).resolve()
+  path = (base / name).resolve()
+  if base not in path.parents or not path.is_file():
+    raise HTTPException(404, '截图不存在或已清理')
+  return FileResponse(path, media_type='image/png')
 
 
 # ==================== 红外巡检图片质量检测（按任务勾选 · 共享只读）====================
@@ -1098,6 +1192,287 @@ async def get_infrared_quality_image(
   if not path:
     raise HTTPException(404, '图片不存在或已清理')
   return FileResponse(path, media_type=mimetypes.guess_type(path)[0] or 'image/jpeg')
+
+
+# ==================== 应急演练记录合规审查（每周任务 · 页面）====================
+# 页面卡片 + 整屏看板：已审演练周列表（部门 × 月份）→ 单周详情（各组流程图/步骤/问题）。
+# 口径见 service/drill_audit/weekly.py；页面只要求 DRILL_AUDIT_ENABLED，
+# 每周一自动审查另需 DRILL_AUDIT_WEEKLY_ENABLED（预设注册）。
+@router.get('/drill-audit/overview')
+@require_permission('ai:agent')
+async def get_drill_audit_overview(
+  request: Request,
+  period: str = Query('', description='月份 YYYY-MM（空 = 最新）'),
+):
+  """页面用：开关、部门列、可选月份、已审周摘要、是否在跑、最近一次运行。"""
+  from service.drill_audit import weekly
+
+  return {'ok': True, 'data': await weekly.build_overview(period=period)}
+
+
+@router.post('/drill-audit/run')
+@require_permission('ai:agent')
+async def trigger_drill_audit_run(request: Request):
+  """后台审查演练周；已在跑则 `started=false`，不排队。
+
+  body 两种形态：
+  - `{items: [{week_id, dept_id?, year?}], refresh?}` —— 页面单周/批量勾选执行；
+  - `{dept_names: [...], refresh?}` —— 全量扫描（保留给定时任务/脚本，页面不再暴露）。
+  `refresh` 绕过内容库重下重解析。
+  """
+  from config.settings import settings
+  from service.drill_audit import weekly
+
+  # 手动触发只要求总开关；每周一自动审查才需要 `DRILL_AUDIT_WEEKLY_ENABLED`（预设注册处管）。
+  if not settings.DRILL_AUDIT_ENABLED:
+    raise HTTPException(400, '应急演练审查未开启（DRILL_AUDIT_ENABLED=false）')
+
+  try:
+    body = await request.json()
+  except Exception:  # noqa: BLE001  无 body / 非 JSON 一律按默认
+    body = None
+  dept_names = None
+  items: list[dict] = []
+  refresh = False
+  if isinstance(body, dict):
+    names = body.get('dept_names')
+    if isinstance(names, list):
+      dept_names = [str(n).strip() for n in names if str(n).strip()] or None
+    raw_items = body.get('items')
+    if isinstance(raw_items, list):
+      for raw in raw_items:
+        raw = raw if isinstance(raw, dict) else {}
+        week_id = str(raw.get('week_id') or '').strip()
+        if not week_id:
+          continue
+        item: dict = {'week_id': week_id}
+        if str(raw.get('dept_id') or '').strip():
+          item['dept_id'] = str(raw.get('dept_id')).strip()
+        try:
+          year = int(raw.get('year') or 0)
+        except (TypeError, ValueError):
+          year = 0
+        if year > 0:
+          item['year'] = year
+        items.append(item)
+    refresh = bool(body.get('refresh'))
+
+  from service.channels.leader import LeaderLock
+
+  lock = LeaderLock('drill_audit:weekly', ttl=900)
+  try:
+    acquired = lock.try_acquire()
+  except Exception as e:  # noqa: BLE001  Redis 抖动按可执行处理
+    import logging
+    logging.getLogger(__name__).warning('演练审查抢锁失败（继续执行）: %s', e)
+    acquired = True
+  if not acquired:
+    return {'ok': True, 'data': {'started': False, 'reason': '已有一次审查在跑'}}
+
+  async def _progress(message: str) -> None:
+    weekly.set_progress(message)
+
+  async def _run():
+    try:
+      if items:
+        await weekly.run_selected_weeks(items, refresh=refresh, progress=_progress)
+      else:
+        await weekly.run_weekly_audit(
+          dept_names=dept_names, refresh=refresh, progress=_progress,
+        )
+    except Exception as e:  # noqa: BLE001  后台任务失败只记日志，页面靠轮询看结果
+      import logging
+      logging.getLogger(__name__).warning('应急演练周审查手动触发失败: %s', e)
+    finally:
+      weekly.clear_progress()
+      lock.release()
+
+  asyncio.create_task(_run())
+  return {'ok': True, 'data': {'started': True}}
+
+
+@router.post('/drill-audit/roster')
+@require_permission('ai:agent')
+async def refresh_drill_audit_roster(request: Request):
+  """后台刷新看板用的演练计划清单（只拉计划，不下载不 OCR 不判定）。
+
+  打开看板时缓存为空或过期由前端自动调用；body 可选 `{dept_names: [...]}`。
+  """
+  from config.settings import settings
+  from service.drill_audit import weekly
+
+  if not settings.DRILL_AUDIT_ENABLED:
+    raise HTTPException(400, '应急演练审查未开启（DRILL_AUDIT_ENABLED=false）')
+
+  try:
+    body = await request.json()
+  except Exception:  # noqa: BLE001
+    body = None
+  dept_names = None
+  if isinstance(body, dict):
+    names = body.get('dept_names')
+    if isinstance(names, list):
+      dept_names = [str(n).strip() for n in names if str(n).strip()] or None
+
+  from service.channels.leader import LeaderLock
+
+  lock = LeaderLock('drill_audit:roster', ttl=900)
+  try:
+    acquired = lock.try_acquire()
+  except Exception as e:  # noqa: BLE001  Redis 抖动按可执行处理
+    import logging
+    logging.getLogger(__name__).warning('演练计划清单抢锁失败（继续执行）: %s', e)
+    acquired = True
+  if not acquired:
+    return {'ok': True, 'data': {'started': False, 'reason': '正在加载计划清单'}}
+
+  async def _run():
+    try:
+      await weekly.refresh_plan_roster(dept_names=dept_names)
+    except Exception as e:  # noqa: BLE001  后台失败只记日志
+      import logging
+      logging.getLogger(__name__).warning('演练计划清单刷新失败: %s', e)
+    finally:
+      lock.release()
+
+  asyncio.create_task(_run())
+  return {'ok': True, 'data': {'started': True}}
+
+
+@router.get('/drill-audit/weeks/{week_id}')
+@require_permission('ai:agent')
+async def get_drill_audit_week(week_id: str, request: Request):
+  """单周详情：周记录 + 逐组演练场景/人员分配/步骤时间轴/流程图/问题。"""
+  from service.drill_audit import detail
+
+  data = await detail.build_week_detail(week_id)
+  if not data:
+    raise HTTPException(404, '该演练周没有审查记录')
+  return {'ok': True, 'data': data}
+
+
+# ==================== 每日变更统计（日常运维 · 页面）====================
+# 只读：读库解析当天的变更通知，出「园区 × 变更类型/执行状态」汇总与明细。
+# 口径见 service/scheduled_task/change_notice/（与每日定时预设同一套），页面不复算。
+def _change_notice_window(date_str: str) -> dict:
+  """页面窗口：`date` 缺省今天（自然日，Asia/Shanghai；今天截至当前时刻）。"""
+  if not date_str:
+    from service.scheduled_task.change_notice import workflow as notice_workflow
+
+    return notice_workflow.today_window()
+  from datetime import datetime, timedelta
+  from zoneinfo import ZoneInfo
+
+  tz = ZoneInfo('Asia/Shanghai')
+  try:
+    start = datetime.strptime(date_str.strip(), '%Y-%m-%d').replace(tzinfo=tz)
+  except ValueError:
+    raise HTTPException(400, 'date 需为 YYYY-MM-DD')
+  end = start + timedelta(days=1)
+  now = datetime.now(tz)
+  if start <= now < end:
+    end = now
+  return {'start': start, 'end': end, 'start_s': int(start.timestamp()),
+          'end_s': int(end.timestamp()), 'key': start.strftime('%Y-%m-%d'),
+          'label': start.strftime('%Y-%m-%d')}
+
+
+@router.get('/change-notices/overview')
+@require_permission('ai:agent')
+async def get_change_notice_overview(
+  request: Request,
+  date: str = Query('', description='YYYY-MM-DD（空 = 今天）'),
+):
+  """页面用：某自然日各园区的变更条数与类型/状态分布。
+
+  `parks` 只含当天有数据的园区（园区筛选下拉用前端固定列表，与这里无关）。
+  """
+  from service.scheduled_task.change_notice import build as notice_build
+  from service.scheduled_task.change_notice import workflow as notice_workflow
+
+  window = _change_notice_window(date)
+  try:
+    events = await notice_workflow.collect_events(
+      window['start_s'], window['end_s'], None)
+  except RuntimeError as e:
+    # 未配置园区群：返回空结果 + 说明，页面照常打开（不当成 500）
+    return {'ok': True, 'data': {'date': window['key'], 'total': 0, 'parks': [],
+                                 'note': str(e)}}
+  groups = notice_build.overview(events)
+  return {'ok': True, 'data': {
+    'date': window['key'],
+    'total': len(events),
+    'parks': [{'park': g['park'], 'total': g['total'],
+               'by_type': g['by_type'], 'by_status': g['by_status'],
+               'by_match': g['by_match']} for g in groups],
+  }}
+
+
+@router.get('/change-notices/records')
+@require_permission('ai:agent')
+async def get_change_notice_records(
+  request: Request,
+  date: str = Query('', description='YYYY-MM-DD（空 = 今天）'),
+  park: str = Query('', description='园区名（空 = 全部）'),
+):
+  """直接回 `{columns, records}`（给 RecordsTable，不套 `{ok, data}`）。"""
+  from service.scheduled_task.change_notice import build as notice_build
+  from service.scheduled_task.change_notice import workflow as notice_workflow
+
+  window = _change_notice_window(date)
+  park_name = park.strip()
+  try:
+    # 与 overview 共用「全园区」缓存键，选园区时不再各算一遍（当天几十条，成本可忽略）
+    events = await notice_workflow.collect_events(
+      window['start_s'], window['end_s'], None)
+  except RuntimeError as e:
+    return {'columns': list(notice_build.PAGE_COLUMNS), 'records': [], 'note': str(e)}
+  if park_name:
+    events = [ev for ev in events if (ev.get('park') or '') == park_name]
+  rows = notice_build.to_rows(events, with_match=True)
+  for row in rows:
+    row[notice_build.MATCH_COLUMN] = row[notice_build.MATCH_KEY]
+  return {'columns': list(notice_build.PAGE_COLUMNS), 'records': rows}
+
+
+_XLSX_MEDIA = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+
+
+@router.get('/change-notices/export')
+@require_permission('ai:agent')
+async def export_change_notices(
+  request: Request,
+  date: str = Query('', description='YYYY-MM-DD（空 = 今天）'),
+  park: str = Query('', description='园区名（空 = 全部）'),
+):
+  """页面「导出 Excel」：按当前日期 + 园区导出明细与统计概览。
+
+  与 overview/records 共用同一份 `collect_events`（含结果缓存），两 sheet：
+  明细 15 列（多一列等级匹配）、重点列带底色；定时/对话产出的 xlsx 仍是 14 列。
+  """
+  from service.scheduled_task.change_notice import build as notice_build
+  from service.scheduled_task.change_notice import workflow as notice_workflow
+  from service.scheduled_task.change_notice import xlsx as notice_xlsx
+
+  window = _change_notice_window(date)
+  try:
+    events = await notice_workflow.collect_events(
+      window['start_s'], window['end_s'], None)
+  except RuntimeError as e:
+    # 园区群未配置：明确报错，不产出误导性的空文件
+    raise HTTPException(400, str(e))
+  park_name = park.strip()
+  if park_name:
+    events = [ev for ev in events if (ev.get('park') or '') == park_name]
+  rows = notice_build.to_rows(events, with_match=True)
+  groups = notice_build.overview(events)
+  data = await asyncio.to_thread(
+    notice_xlsx.to_bytes, rows, groups, '变更统计明细', window['label'], page=True)
+  name = f'变更统计_{window["key"]}{"_" + park_name if park_name else ""}.xlsx'
+  return Response(
+    data, media_type=_XLSX_MEDIA,
+    headers={'Content-Disposition': f"attachment; filename*=UTF-8''{quote(name)}"},
+  )
 
 
 @router.get('/{task_id}')

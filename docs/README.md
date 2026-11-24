@@ -10,7 +10,7 @@
 | [capability-catalog-scaling-design.md](architecture/capability-catalog-scaling-design.md) | 能力注册与工具编排：四层分类 + 工具规模收敛 |
 | [platform-capabilities.md](architecture/platform-capabilities.md) | 全部平台能力清单（mgmt / dcim_meta / web / browser / skills） |
 | [agent-tool-center.md](architecture/agent-tool-center.md) | 工具目录小窗：分组、可见性、与部署开关的关系 |
-| [agent-skill-management.md](architecture/agent-skill-management.md) | 技能中心：列表 / 详情 / 启停 / 删除 |
+| [agent-skill-management.md](architecture/agent-skill-management.md) | 智能体：技能列表 / 详情 / 启停 / 删除 |
 
 ## dcim/ — 动环数据接入全链路
 
@@ -29,7 +29,10 @@
 |---|---|
 | [browser-capture.md](features/browser-capture.md) | 内网页面操作平台：配方截图 + 交互浏览 + 旁路容器 |
 | [compliance-alarm-check.md](features/compliance-alarm-check.md) | 告警不合规检查：班次窗口、四项口径、Excel 产物 |
+| [compliance-summary-cards.md](features/compliance-summary-cards.md) | 合规页四张汇总卡：统一小字骨架、单列一行一卡、一句语境 + 带颜色的小数字指标 + 底栏元信息 |
+| [daily-change-notice.md](features/daily-change-notice.md) | 日常变更统计：园区运维群人发通知、四种报文、自然日去重 |
 | [doc-update-check.md](features/doc-update-check.md) | 月度文档更新检查：各公司部门 × 25 项、内容哈希判据 |
+| [drill-audit.md](features/drill-audit.md) | 应急演练记录合规审查：班组扫描件 OCR × 知识库 EOP 比对 |
 | [event-report-alarm-link.md](features/event-report-alarm-link.md) | 事件报告关联 DCIM 告警：匹配口径、告警值、四档阈值 |
 | [feishu-group-realtime-ingest.md](features/feishu-group-realtime-ingest.md) | 飞书群消息实时入库：WS 推送、游标补偿、撤回、HA |
 | [infrared-quality-check.md](features/infrared-quality-check.md) | 红外巡检图片质量检测：勾选任务、Gradio 推理、缓存 |

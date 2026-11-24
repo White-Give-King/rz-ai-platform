@@ -124,6 +124,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
       logger.warning('文档更新检查预设初始化失败（不影响启动）: %s', e)
 
+    # 应急演练周审查预设（`drill_audit__`，默认关：两个开关都开才建）
+    try:
+      from service.drill_audit.presets import ensure_drill_audit_presets
+      akeys = await ensure_drill_audit_presets()
+      if akeys:
+        logger.info('应急演练周审查预设就绪: %s', akeys)
+    except Exception as e:
+      logger.warning('应急演练周审查预设初始化失败（不影响启动）: %s', e)
+
+    # 每日变更统计预设（`change_notice__`，默认关：CHANGE_NOTICE_ENABLED=false 时返回空）
+    try:
+      from service.scheduled_task.change_notice.presets import ensure_change_notice_presets
+      nkeys = await ensure_change_notice_presets()
+      if nkeys:
+        logger.info('每日变更统计预设就绪: %s', nkeys)
+    except Exception as e:
+      logger.warning('每日变更统计预设初始化失败（不影响启动）: %s', e)
+
     try:
       from service.scheduled_task.scheduler import start as scheduled_start
       await scheduled_start()

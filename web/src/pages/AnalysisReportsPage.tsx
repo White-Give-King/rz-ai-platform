@@ -21,6 +21,7 @@ const TICKET_OPTS: Opt[] = [
   { value: '', label: '全部类型' }, { value: 'change', label: '变更工单' },
   { value: 'breakdown', label: '故障工单' }, { value: 'question', label: '问题工单' },
   { value: 'event', label: '事件工单' }, { value: 'threshold', label: '阈值工单' },
+  { value: 'changenotice', label: '变更通知合规' },
 ];
 // 空间与园区合并成一个下拉（两者本是同一维度的两级，后端也是两个参数各自过滤）。
 // 值的编码：'' 全部空间 | 'nationwide' 全国 | 'by_park' 各园区（聚合） | 'park:<slug>' 具体园区

@@ -86,7 +86,7 @@ export default function OverviewPage() {
   const hasPermission = useAuthStore((s) => s.hasPermission);
   const userName = user?.name || user?.phone || '用户';
   const visibleModules = modules.filter((m) => !m.perm || hasPermission(m.perm));
-  const [overview, setOverview] = useState<OverviewData>({ api_call_count: 0, api_call_change: null, tool_call_count: 0, compute_usage: 0, compute_usage_change: null, user_count: 0, message_count: 0, session_count: 0, session_change: null, video_count: 0, video_change: null, risk_check_count: 0, risk_check_change: null, fire_safety_count: 0, fire_safety_change: null, doc_count: 0 });
+  const [overview, setOverview] = useState<OverviewData>({ api_call_count: 0, api_call_change: null, tool_call_count: 0, compute_usage: 0, compute_usage_change: null, user_count: 0, message_count: 0, session_count: 0, session_change: null, video_count: 0, video_change: null, risk_check_count: 0, risk_check_change: null, fire_safety_count: 0, fire_safety_change: null, report_count: 0, report_change: null, doc_count: 0 });
   const [activities, setActivities] = useState<ActivityItem[]>([]);
   const [trend, setTrend] = useState<TrendItem[]>([]);
   // 个人通知开关（SettingsPage「动态通知」，key rz_notify_enabled）：关闭后首页动态不展示个人活动
@@ -112,7 +112,7 @@ export default function OverviewPage() {
           { label: '对话会话', value: overview.session_count, icon: MessageSquareText, sub: '本周会话', tone: 'text-chart-2', accent: 'var(--chart-2)' },
           { label: '视频生成', value: overview.video_count, icon: Clapperboard, sub: '本周任务', tone: 'text-chart-3', accent: 'var(--chart-3)' },
           { label: '隐患识别', value: overview.risk_check_count, icon: ShieldAlert, sub: '本周检测', tone: 'text-chart-4', accent: 'var(--chart-4)' },
-          { label: '消防配置', value: overview.fire_safety_count, icon: Flame, sub: '本周推荐', tone: 'text-orange-500', accent: '#fb923c' },
+          { label: '统计分析报告', value: overview.report_count, icon: FileText, sub: '本周生成', tone: 'text-chart-7', accent: 'var(--chart-7)' },
           { label: '知识库', value: overview.doc_count, icon: BookOpen, sub: '文档总数', tone: 'text-primary', accent: 'var(--primary)' },
         ].map((s) => {
           const Icon = s.icon;
@@ -166,7 +166,7 @@ export default function OverviewPage() {
               { name: '对话助手', value: overview.message_count, color: 'var(--chart-1)' },
               { name: '视频生成', value: overview.video_count, color: 'var(--chart-2)' },
               { name: '隐患识别', value: overview.risk_check_count, color: 'var(--chart-3)' },
-              { name: '消防配置', value: overview.fire_safety_count, color: 'var(--chart-4)' },
+              { name: '统计分析报告', value: overview.report_count, color: 'var(--chart-4)' },
             ]} />
           </CardContent>
         </Card>

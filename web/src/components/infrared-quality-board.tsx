@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
-  ArrowLeft, ChevronLeft, ChevronRight, ImageOff, Loader2, ScanEye,
+  ChevronLeft, ChevronRight, ImageOff, Loader2, ScanEye,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { FilterSelect } from '@/components/filter-select';
 import { RecordsTable } from '@/components/RecordsTable';
 import { FullScreenOverlay } from '@/components/full-screen-overlay';
+import { BoardHeader, type Crumb } from '@/components/board-header';
 import { cn } from '@/lib/utils';
 import {
   infraredQualityRecordsUrl, triggerInfraredQualityCheck,
@@ -42,16 +43,21 @@ const FILTER_LABEL: Record<Filter, string> = {
 };
 
 /** 四档判定：顺序、文案、色点只在这里定义，结果列与 KPI 分布卡共用。 */
-const COUNT_ORDER = [
-  { key: '合格', label: '合格', dot: 'bg-success', text: 'text-success' },
-  { key: '待复核', label: '待复核', dot: 'bg-warning', text: 'text-warning' },
-  { key: '不合格', label: '不合格', dot: 'bg-destructive', text: 'text-destructive' },
-  { key: '检测失败', label: '失败', dot: 'bg-muted-foreground/50', text: 'text-muted-foreground' },
+export const COUNT_ORDER = [
+  { key: '合格', label: '合格', dot: 'bg-success', text: 'text-success',
+    chip: 'bg-success/12 text-success' },
+  { key: '待复核', label: '待复核', dot: 'bg-warning', text: 'text-warning',
+    chip: 'bg-warning/12 text-warning' },
+  { key: '不合格', label: '不合格', dot: 'bg-destructive', text: 'text-destructive',
+    chip: 'bg-destructive/10 text-destructive' },
+  { key: '检测失败', label: '失败', dot: 'bg-muted-foreground/50', text: 'text-muted-foreground',
+    chip: 'bg-muted text-muted-foreground' },
 ] as const satisfies readonly {
   key: keyof InfraredQualityCounts;
   label: string;
   dot: string;
   text: string;
+  chip: string;
 }[];
 
 function sumCounts(counts: InfraredQualityCounts): number {
@@ -179,9 +185,10 @@ function RunProgress({ progress }: { progress: InfraredQualityProgress | null })
   );
 }
 
-/** 全屏看板：勾任务 → 检测 → 看明细。任务列表与明细不同屏，点任务行进入明细、可返回。 */
+/** 详情看板：勾任务 → 检测 → 看明细。任务列表与明细不同屏，点任务行进入明细，
+ *  面包屑的「红外巡检图片质量」可返回任务列表；侧边栏与平台顶栏保持可见。 */
 export function InfraredQualityBoard({
-  data, deptId, onDeptChange, running, onClose, onRefresh, onNotice,
+  data, deptId, onDeptChange, running, onClose, onRefresh,
 }: {
   data: InfraredQualityOverview;
   deptId: string;
@@ -189,8 +196,9 @@ export function InfraredQualityBoard({
   running: boolean;
   onClose: () => void;
   onRefresh: () => void;
-  onNotice: (text: string) => void;
 }) {
+  // 启动反馈就显示在操作发生的地方（看板内），卡片上不再承载 notice
+  const [notice, setNotice] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [filter, setFilter] = useState<Filter>('all');
   const [refreshPred, setRefreshPred] = useState(false);
@@ -246,16 +254,16 @@ export function InfraredQualityBoard({
   const start = async () => {
     if (!canStart) return;
     setStarting(true);
-    onNotice('');
+    setNotice('');
     try {
       const res = await triggerInfraredQualityCheck({
         dept_id: deptId, task_ids: [...selected], refresh: refreshPred,
       });
       if (!res.started) {
-        onNotice(res.reason || '已有一次检测在跑，请稍候');
+        setNotice(res.reason || '已有一次检测在跑，请稍候');
       }
     } catch {
-      onNotice('启动检测失败，请稍后重试');
+      setNotice('启动检测失败，请稍后重试');
     } finally {
       setStarting(false);
       onRefresh();
@@ -271,40 +279,33 @@ export function InfraredQualityBoard({
   const inDetail = Boolean(view.runId || view.taskId);
   const latest = data.latest_run;
 
+  const crumbs: Crumb[] = [
+    { label: '合规检查', onClick: onClose },
+    { label: '红外巡检图片质量', onClick: inDetail ? () => setView({}) : undefined },
+    ...(inDetail ? [{ label: view.runId ? '本次检测明细' : '任务明细' }] : []),
+  ];
+
   return (
     <FullScreenOverlay>
-      {/* 页头：返回与标题同一行，说明单独一行，只有两行 */}
-      <header className="shrink-0 border-b border-border bg-card px-4 py-3 sm:px-6">
-        <div className="flex items-center gap-2">
-          <Button
-            size="icon-sm"
-            variant="ghost"
-            className="-ml-1.5"
-            onClick={onClose}
-            aria-label="返回目录"
-          >
-            <ArrowLeft className="size-4" />
-          </Button>
-          <h1 className="text-lg font-semibold leading-tight">红外巡检图片质量</h1>
-          {running && (
-            <Badge variant="warning">
-              <Loader2 className="size-3 animate-spin" />检测中
-            </Badge>
-          )}
-        </div>
-        <p className="mt-0.5 pl-8 text-xs text-muted-foreground">
-          sharp 为合格 · borderline 待复核 · defocused 为不合格 · 其余（uncertain 等）一律按检测失败
-        </p>
-      </header>
+      <BoardHeader
+        onBack={onClose}
+        crumbs={crumbs}
+        actions={running ? (
+          <Badge variant="warning">
+            <Loader2 className="size-3 animate-spin" />检测中
+          </Badge>
+        ) : undefined}
+      />
 
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden px-4 py-4 sm:px-6">
+        {notice && (
+          <p className="shrink-0 rounded-lg bg-warning/10 px-3 py-2 text-xs text-warning">
+            {notice}
+          </p>
+        )}
         {inDetail ? (
           <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card">
             <div className="flex min-h-12 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-4 py-2">
-              <Button size="sm" variant="ghost" className="-ml-2" onClick={() => setView({})}>
-                <ArrowLeft className="size-4" /> 任务列表
-              </Button>
-              <span className="h-4 w-px bg-border" />
               <span className="text-sm font-semibold">
                 {view.runId ? '本次检测明细' : '任务明细'}
               </span>

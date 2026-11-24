@@ -14,7 +14,7 @@
 |--------|------|------|
 | `matched` | 已确定告警身份 | 永久 |
 | `not_covered` | 明确不在覆盖范围（非廊坊 / 早于 2026-10-29） | 永久（指纹变了才重判） |
-| `no_alarm` | ±120s 内无候选 | 到 `recheck_after` 前**每次重查**（等数据落库），之后永久 |
+| `no_alarm` | 发生时间那一秒无候选 | 到 `recheck_after` 前**每次重查**（等数据落库），之后永久 |
 | `ambiguous` | 多候选且模型判不出 | 永久（显式 refresh 才重判） |
 
 `unknown`（档案不可用 / 仲裁调用异常）与 `no_time`（缺发生时间）**不落表**，下次重试。
@@ -36,8 +36,9 @@ from config.mongodb_conn import mongodb_manager
 logger = logging.getLogger(__name__)
 
 COLLECTION = 'event_alarm_link_decisions'
-# 匹配规则变更（时间窗、候选判定、仲裁口径）时 +1，旧判定自动失效。
-RULE_VERSION = 1
+# 匹配规则变更（时间口径、候选判定、仲裁口径）时 +1，旧判定自动失效。
+# v2：时间口径从「±120s 窗口」改为「发生时间精确同秒」（2026-11-19）。
+RULE_VERSION = 2
 # 覆盖范围指纹：园区代号集合 + 数据起始日。范围变了旧判定（尤其是 not_covered）失效。
 COVERAGE_FINGERPRINT = '廊坊A|廊坊B1M1|廊坊B1M2@2026-10-29'
 

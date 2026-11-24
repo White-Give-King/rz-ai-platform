@@ -245,15 +245,30 @@ def _window_note(window_label: str, start_s: int) -> str:
           + tail)
 
 
-def _parse_bound(value: str, label: str) -> tuple[datetime, bool]:
-  """`YYYY-MM-DD`（含整天）或 `YYYY-MM-DD HH:MM`（精确到分）；返回 (时间, 是否带时分)。"""
-  text = value.strip()
-  for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d'):
+def _parse_bound(value: str, label: str) -> tuple[datetime, bool, bool]:
+  """`YYYY-MM-DD`（含整天）/ `HH:MM` / `HH:MM:SS`；返回 (时间, 是否带时分, 是否带秒)。
+
+  用户会直接给到秒（「2026-11-13 12时55分00秒」），只认到分钟会让解析失败、
+  模型只能退回 `date` 查整天。
+  """
+  text = value.strip().replace('T', ' ')
+  for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
     try:
-      return datetime.strptime(text, fmt).replace(tzinfo=_TZ), '%H' in fmt
+      return (datetime.strptime(text, fmt).replace(tzinfo=_TZ),
+              '%H' in fmt, '%S' in fmt)
     except ValueError:
       continue
-  raise ValueError(f'{label} 需为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM（收到 {value!r}）')
+  raise ValueError(f'{label} 需为 YYYY-MM-DD、YYYY-MM-DD HH:MM 或 '
+                   f'YYYY-MM-DD HH:MM:SS（收到 {value!r}）')
+
+
+# 只给了时刻（没有 end）= 该时刻起 1 分钟窗口（「12:55:00 这个时间的消息」）
+_INSTANT_WINDOW = timedelta(minutes=1)
+
+
+def _range_label(start_dt: datetime, end_dt: datetime, with_seconds: bool) -> str:
+  fmt = '%Y-%m-%d %H:%M:%S' if with_seconds else '%Y-%m-%d %H:%M'
+  return f'{start_dt:{fmt}} ~ {end_dt:{fmt}}'
 
 
 def _window(start: str, end: str, shift: str = '',
@@ -270,54 +285,61 @@ def _window(start: str, end: str, shift: str = '',
     if end:
       raise ValueError('传 end 时需同时传 start')
     start_dt, end_dt, shift_name = _resolve_shift(shift, date_str)
-    label = f'{shift_name} {start_dt:%Y-%m-%d %H:%M} ~ {end_dt:%Y-%m-%d %H:%M}'
+    label = _range_label(start_dt, end_dt, with_seconds=False)
+    label = f'{shift_name} {label}'
   else:
-    start_dt, start_has_time = _parse_bound(start, 'start')
+    start_dt, start_has_time, start_sec = _parse_bound(start, 'start')
+    end_sec = False
     if end:
-      end_dt, end_has_time = _parse_bound(end, 'end')
+      end_dt, end_has_time, end_sec = _parse_bound(end, 'end')
       if end_has_time and not start_has_time:
         raise ValueError('start 与 end 的精度要一致（都带时分或都不带）')
       if not end_has_time:
         end_dt += timedelta(days=1)      # 日期含首尾 → 次日 00:00
     elif start_has_time:
-      raise ValueError('start 带时分时需同时传 end')
+      end_dt = start_dt + _INSTANT_WINDOW   # 只给时刻 = 该时刻起 1 分钟
     else:
       end_dt = start_dt + timedelta(days=7)
-    label = f'{start_dt:%Y-%m-%d %H:%M} ~ {end_dt:%Y-%m-%d %H:%M}'
+    label = _range_label(start_dt, end_dt, start_sec or end_sec)
   if end_dt <= start_dt:
     raise ValueError('end 必须晚于 start')
   return int(start_dt.timestamp()), int(end_dt.timestamp()), label
 
 
 def _event_window(date_str: str, start: str, end: str) -> tuple[int, int, str]:
-  """事件的**自然日**窗口（不套班次）：date=该日整天；start/end=日期区间；都不传=今天。
+  """事件的**自然日**窗口（不套班次）：date=该日整天；start/end=区间或时刻；都不传=今天。
 
   查单个事件的进展时用户说的是「今天 / 11 月 9 日」这种自然日，不是值守班次。
+  用户给到具体时刻（`YYYY-MM-DD HH:MM[:SS]`）时只传 `start` = 该时刻起 1 分钟窗口。
   """
   if date_str and (start or end):
     raise ValueError('date 与 start/end 不能同时传：指定某天用 date，日期区间用 start/end')
   if date_str:
     start_dt = datetime.combine(_parse_day(date_str), datetime.min.time()).replace(tzinfo=_TZ)
     end_dt = start_dt + timedelta(days=1)
+    with_seconds = False
   elif start:
-    start_dt, start_has_time = _parse_bound(start, 'start')
+    start_dt, start_has_time, start_sec = _parse_bound(start, 'start')
+    end_sec = False
     if end:
-      end_dt, end_has_time = _parse_bound(end, 'end')
+      end_dt, end_has_time, end_sec = _parse_bound(end, 'end')
       if end_has_time and not start_has_time:
         raise ValueError('start 与 end 的精度要一致（都带时分或都不带）')
       if not end_has_time:
         end_dt += timedelta(days=1)
     elif start_has_time:
-      raise ValueError('start 带时分时需同时传 end')
+      end_dt = start_dt + _INSTANT_WINDOW
     else:
       end_dt = start_dt + timedelta(days=7)
+    with_seconds = start_sec or end_sec
   else:
     start_dt = datetime.now(_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     end_dt = start_dt + timedelta(days=1)
+    with_seconds = False
   if end_dt <= start_dt:
     raise ValueError('end 必须晚于 start')
-  label = f'{start_dt:%Y-%m-%d %H:%M} ~ {end_dt:%Y-%m-%d %H:%M}'
-  return int(start_dt.timestamp()), int(end_dt.timestamp()), label
+  return (int(start_dt.timestamp()), int(end_dt.timestamp()),
+          _range_label(start_dt, end_dt, with_seconds))
 
 
 def _shift_at(ts: int) -> tuple[datetime, datetime, str]:
@@ -420,9 +442,11 @@ async def incident_report(
       用户说「今天/昨天/白班/晚班/上一班」时**只传 shift**，不要自己换算时刻。
     date: `YYYY-MM-DD`。**单独传（shift 留空）= 该日白班+晚班**（该日 08:30 ~ 次日 08:30）；
       配 `shift=day|night` 指定哪一天（缺省=最近一次已开始的该班次）。
-    start: 起始日期 `YYYY-MM-DD`（自然日，含当天）或 `YYYY-MM-DD HH:MM`。**只在用户明确给出
-      日期区间时传**（如「10 月 20 日到 22 日」），不能与 shift/date 同时传。
-    end: 结束日期，格式精度与 start 一致。留空 = start 起 7 个自然日。
+    start: 起始时间 `YYYY-MM-DD`（自然日，含当天）、`YYYY-MM-DD HH:MM` 或
+      `YYYY-MM-DD HH:MM:SS`。
+      **只在用户明确给出日期/时刻区间时传**（如「10 月 20 日到 22 日」「12:55 那一分钟」），
+      不能与 shift/date 同时传；带时分时 end 留空 = 该时刻起 1 分钟。
+    end: 结束时间，格式精度与 start 一致（都带秒才精确到秒）。留空 = start 起 7 个自然日。
     parks: 园区名，逗号分隔（如「廊坊」或「廊坊,平湖」）。留空 = 所有已配置园区群。
     sync: 是否先从飞书群补拉该窗口的通报（默认 true，需要机器人已在群里）。
     export_excel: 是否产出 22 列 xlsx（默认 false）。仅用户明确要 Excel/文件/导出时置 true。
@@ -583,8 +607,9 @@ async def incident_progress(
   Args:
     query: 事件关键词，如「A2 UPS」「湿度过低」。留空 = 窗口内全部事件（用于让用户选）。
     date: `YYYY-MM-DD`，查该自然日（00:00–24:00）。不传 = 今天。
-    start: 起始日期 `YYYY-MM-DD`（含当天）或 `YYYY-MM-DD HH:MM`，与 end 配对；与 date 互斥。
-    end: 结束日期，精度与 start 一致；留空 = start 起 7 天。
+    start: 起始时间 `YYYY-MM-DD`（含当天）、`YYYY-MM-DD HH:MM` 或 `YYYY-MM-DD HH:MM:SS`；
+      与 date 互斥，带时分时 end 留空 = 该时刻起 1 分钟。
+    end: 结束时间，精度与 start 一致；只有日期时留空 = start 起 7 天。
     parks: 园区名，逗号分隔（如「廊坊」）；留空 = 所有已配置园区群。
   """
   try:
@@ -700,4 +725,145 @@ async def incident_progress(
   result.update(records_url=records_url, file_tag=file_tag)
   if result['mode'] == 'inline':
     result['table_markdown'] = _markdown_table(columns, progress)
+  return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+async def group_message_search(
+  query: str = '',
+  date: str = '',
+  start: str = '',
+  end: str = '',
+  parks: str = '',
+  sender: str = '',
+  kind: str = '',
+  config: RunnableConfig = None,
+) -> str:
+  """检索**应急 / 事件通报群**里已入库的消息原文（含普通闲聊，不只事件通报）。
+
+  范围边界：只覆盖**应急 / 事件通报群**（`dcim_incident_reports`），**不含「日常运维工作群」
+  的变更通知**——要统计变更请用 `change_notice_report`。
+  用户问「群里今天都说了什么 / 有没有人提到 XX / 谁发过 XX」时用它：
+  数据来自飞书 WS 实时入库的本地库，**不调用飞书接口**（不受群消息读权限限制）。
+  关键词按空格或逗号分隔 = **全部命中**（忽略大小写）；窗口默认**自然日**，不是值守班次。
+  用户给出**具体时刻**（如「12 时 55 分 00 秒」）时用 `start='YYYY-MM-DD HH:MM[:SS]'`
+  精确到分/秒（可只传 start = 该时刻起 1 分钟），**不得**退回 `date` 查整天。
+
+  返回里的 `mode` 决定怎么交付：
+  - `inline`：命中 ≤20 条，原样输出 `table_markdown` 与 `file_tag`；
+  - `records`：命中更多，原样输出 `file_tag` 打开交互表格（正文只说明条数与范围）；
+  - `empty`：窗口内没有匹配消息，按 `note` 说明并建议放宽条件。
+
+  Args:
+    query: 关键词，空格或逗号分隔（全部命中），如「UPS 告警」。留空 = 不过滤。
+    date: `YYYY-MM-DD`，查该自然日。不传 = 今天。
+    start: 起始时间 `YYYY-MM-DD`（含当天）、`YYYY-MM-DD HH:MM` 或 `YYYY-MM-DD HH:MM:SS`；
+      与 date 互斥，带时分时 end 留空 = 该时刻起 1 分钟。
+    end: 结束时间，精度与 start 一致；只有日期时留空 = start 起 7 天。
+    parks: 园区名，逗号分隔（如「廊坊」）；留空 = 所有已配置园区群。
+    sender: 发送人子串（姓名或 open_id）；留空 = 不限。
+    kind: 消息类型：`sos`(速报) / `first`(通报) / `other`(普通消息)；留空 = 全部。
+  """
+  try:
+    start_s, end_s, window_label = _event_window(date, start, end)
+  except ValueError as e:
+    return _err(str(e))
+
+  from service.scheduled_task.incident_stats import messages as messages_mod
+
+  normalized = messages_mod.kind_from_alias(kind)
+  if not normalized:
+    kinds: tuple[str, ...] = ()
+  elif normalized == 'change':
+    return _err('变更通知不在本工具范围（本工具只查应急/事件通报群）；'
+                '统计变更请用 change_notice_report。')
+  elif normalized in messages_mod.KINDS:
+    kinds = (normalized,)
+  else:
+    return _err(f'kind 只支持 sos/first/other（或留空），收到「{kind}」')
+
+  park_list, missing = _resolve_parks(parks)
+  if missing:
+    available = '、'.join(_configured_parks()) or '（未配置）'
+    return _err(f'园区未配置园区群：{"、".join(missing)}；当前可用：{available}')
+  if not park_list:
+    return _err('未配置园区群（INCIDENT_FEISHU_PARK_CHATS 为空），无法确定查哪个园区；'
+                '请先让机器人进群并在部署配置里登记。')
+
+  from service.scheduled_task.incident_stats import feishu as feishu_mod
+  from service.scheduled_task.incident_stats import source
+
+  try:
+    chats = await feishu_mod.resolve_park_chats()
+  except Exception as e:
+    return _err(f'无法解析园区群：{type(e).__name__}: {str(e)[:200]}')
+  unresolved = [p for p in park_list if not chats.get(p)]
+  skipped: list[str] = []
+  if unresolved:
+    if _split_parks(parks):
+      return _err(f'园区群未解析到 chat_id：{"、".join(unresolved)}（机器人是否已进群？）')
+    skipped = unresolved
+    park_list = [p for p in park_list if chats.get(p)]
+    if not park_list:
+      return _err(f'没有可用的园区群：{"、".join(skipped)}'
+                  '（群名未匹配或机器人未进群），无法查询。')
+    logger.warning('[Incident] 跳过未配置群的园区: %s', skipped)
+
+  park_by_chat = {chats[p]: p for p in park_list if chats.get(p)}
+  tokens = messages_mod.split_tokens(query)
+
+  def _collect() -> list[dict]:
+    rows = source.load_messages(start_s, end_s, chat_ids=list(park_by_chat))
+    return messages_mod.filter_messages(rows, tokens=tokens, sender=sender, kinds=kinds)
+
+  try:
+    rows = await asyncio.to_thread(_collect)
+  except Exception as e:
+    logger.exception('[Incident] 群消息检索取数失败')
+    return _err(f'查询失败：{type(e).__name__}: {str(e)[:200]}')
+
+  result: dict = {
+    'window': window_label,
+    'parks': park_list,
+    'kind': normalized or 'all',
+    'total': len(rows),
+  }
+  if skipped:
+    result['skipped_parks'] = skipped
+
+  if not rows:
+    conds = []
+    if query:
+      conds.append(f'关键词「{query}」')
+    if sender:
+      conds.append(f'发送人「{sender}」')
+    if kinds:
+      conds.append(f'类型「{messages_mod.kind_label(kinds[0])}」')
+    reason = ('（' + '、'.join(conds) + '）') if conds else ''
+    result.update(mode='empty', note=(
+      f'{window_label} 内没有匹配的消息{reason}。'
+      '可换日期（date）或区间（start/end），或去掉关键词/类型再试。'))
+    return json.dumps(result, ensure_ascii=False)
+
+  table_rows = messages_mod.to_table_rows(rows, park_by_chat)
+  thread_id = _get_thread_id(config)
+  from core.sandbox.datasets import save_dataset
+
+  info = await asyncio.to_thread(
+    save_dataset, thread_id, 'group_messages',
+    {'date': date, 'start': start, 'end': end, 'query': query,
+     'parks': park_list, 'sender': sender, 'kind': normalized or 'all'},
+    table_rows, 'feishu-messages',
+  )
+  records_url = (f'/api/v1/chat/agent/artifacts/{quote(thread_id, safe="")}/'
+                 f'{quote(info["dataset_id"], safe="")}/records')
+  file_tag = f'<file url="{records_url}" name="飞书消息"/>'
+
+  result.update(records_url=records_url, file_tag=file_tag)
+  if len(table_rows) <= _INLINE_MAX_ROWS:
+    result.update(mode='inline',
+                  table_markdown=_markdown_table(list(messages_mod.TABLE_COLUMNS), table_rows))
+  else:
+    result.update(mode='records',
+                  note=f'共 {len(table_rows)} 条，输出 file_tag 打开交互表格查看。')
   return json.dumps(result, ensure_ascii=False)

@@ -1,6 +1,7 @@
-import type { ReactNode } from 'react';
+import { isValidElement, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import TableActions from './TableActions';
 import MermaidRenderer from './MermaidRenderer';
 import { cn } from '@/lib/utils';
@@ -41,22 +42,27 @@ const markdownComponents = {
       </TableActions>
     );
   },
-  code: ({ className, children, ...props }: { className?: string; children?: ReactNode }) => {
-    const codeText = String(children).replace(/\n$/, '');
-    if (className === 'language-mermaid') {
-      return <MermaidRenderer code={codeText} />;
+  pre: ({ children }: { children?: ReactNode }) => {
+    // mermaid 渲染成 div，不能再套进 <pre>
+    const first = Array.isArray(children) ? children[0] : children;
+    if (isValidElement(first) && first.type === MermaidRenderer) return <>{children}</>;
+    return <pre className="overflow-x-auto rounded-lg bg-muted p-3 my-3">{children}</pre>;
+  },
+  code: ({ className, children }: { className?: string; children?: ReactNode }) => {
+    const raw = String(children);
+    // rehype-highlight 可能给已有类名追加 hljs，故用 includes 判断
+    if (className?.includes('language-mermaid')) {
+      return <MermaidRenderer code={raw.replace(/\n$/, '')} />;
     }
-    if (!className) {
+    // 块级：高亮后 children 是 token 元素树（不能 String 化），无语言的围栏块以换行结尾；
+    // <pre> 外壳统一由上面的 pre 组件提供，这里只返回 <code>，避免 <pre><pre> 嵌套。
+    if (className?.includes('hljs') || raw.endsWith('\n')) {
       return (
-        <code className="rounded bg-muted px-1 py-0.5 text-xs font-mono" {...props}>
-          {children}
-        </code>
+        <code className={cn(className, 'text-xs font-mono')}>{children}</code>
       );
     }
     return (
-      <pre className="overflow-x-auto rounded-lg bg-muted p-3 my-3">
-        <code className="text-xs font-mono">{codeText}</code>
-      </pre>
+      <code className="rounded bg-muted px-1 py-0.5 text-xs font-mono">{children}</code>
     );
   },
 };
@@ -86,6 +92,7 @@ export function MarkdownContent({
       */}
       <ReactMarkdown
         remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
+        rehypePlugins={[[rehypeHighlight, { detect: false, ignoreMissing: true }]]}
         components={markdownComponents}
       >
         {content}

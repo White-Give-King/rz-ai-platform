@@ -13,6 +13,7 @@ from service.doc_update.verdict import (
   STATUS_BASELINE,
   STATUS_FAILED,
   STATUS_MISSING,
+  STATUS_REVIEW,
   STATUS_STALE,
   STATUS_UPDATED,
   evaluate,
@@ -201,6 +202,228 @@ def test_no_reference_is_baseline():
   # 首期只说基线，不能说「未更新」
   assert '未更新' not in text, text
   assert '已建立基线' in text
+
+
+def _ditem(number, files, judge='new', layout='flat', period_only=False,
+           latest_period='', expected='2026-10', period_source='name',
+           review_files=(), pending_files=()):
+  return {'seq': 1, 'number': number, 'name': 'X', 'cadence': '月度', 'note': '',
+          'judge': judge, 'layout': layout, 'period_only': period_only,
+          'expected_period': expected, 'latest_period': latest_period,
+          'period_source': period_source, 'matched_count': len(files),
+          'review_files': list(review_files),
+          'pending_files': list(pending_files), 'files': files, 'error': ''}
+
+
+def _dept_snap(period, items, dept_id='d1', taken_at=NOW):
+  return {'period_key': period, 'period_label': period, 'taken_at': taken_at,
+          'depts': [{'company_id': 'c1', 'company_name': '廊坊',
+                     'dept_id': dept_id, 'dept_name': 'A18', 'items': items}]}
+
+
+def _pfile(fid, period):
+  return {'fid': fid, 'file_name': f'{fid}.pdf', 'path': '', 'match_dir': '',
+          'period': period, 'size': 100, 'download_size': 0, 'sha256': '',
+          'error': '', 'warn': '', 'last_changed_at': ''}
+
+
+def test_dept_flat_period_stale():
+  """扁平查新增项：文件名解析出期号即按期判 —— 首期也不该是基线。"""
+  latest = _dept_snap('2026-11', [_ditem(
+    '4.1.6', [_pfile('f1', '2026-10')], latest_period='2026-10')])
+  v = evaluate(latest, None, NOW)
+  item = v['items'][0]
+  assert item['status'] == STATUS_STALE, item
+  assert item['latest_period'] == '2026-10'
+  assert item['period_source'] == 'name'
+  assert v['counts'][STATUS_BASELINE] == 0
+  assert item['files'][0]['status'] == STATUS_STALE
+
+
+def test_dept_flat_period_updated():
+  latest = _dept_snap('2026-10', [_ditem(
+    '4.1.6', [_pfile('f1', '2026-09'), _pfile('f2', '2026-10')],
+    latest_period='2026-10')])
+  v = evaluate(latest, None, NOW)
+  item = v['items'][0]
+  assert item['status'] == STATUS_UPDATED, item
+  # 文件级各按自己期号判；页面列表只留本期/最新一期（更早的 f1 由 matched_count 提示）
+  status = {f['fid']: f['status'] for f in item['files']}
+  assert status == {'f2': STATUS_UPDATED}, status
+  assert item['file_count'] == 1 and item['matched_count'] == 2, item
+
+
+def test_dept_flat_cancels_undated_when_dated_present():
+  """扁平查新增项：只要有文件解析出期号，无期号文件（模板/年度汇总）被取消匹配。"""
+  files = [_pfile('f1', '2026-10'),
+           {'fid': 't1', 'file_name': '模板_V1.xlsx', 'path': '', 'period': ''}]
+  latest = _dept_snap('2026-10', [_ditem(
+    '4.1.6', files, latest_period='2026-10')])
+  item = evaluate(latest, None, NOW)['items'][0]
+  assert item['status'] == STATUS_UPDATED, item
+  # 无期号的模板被取消：列表只留带期号的文件，匹配总数仍如实反映
+  assert [f['fid'] for f in item['files']] == ['f1'], item['files']
+  assert item['file_count'] == 1 and item['matched_count'] == 2, item
+
+
+def test_dept_flat_no_period_falls_back_to_fid():
+  """期号全部解析不出（模型兜底也没成）：维持原 fid / 基线口径。"""
+  files = [{'fid': 'f1', 'file_name': 'a.pdf', 'period': ''}]
+  # 有上期且 fid 是新的 → 已更新
+  prev = _dept_snap('2026-09', [_ditem('4.1.6', [
+    {'fid': 'old', 'file_name': 'old.pdf', 'period': ''}])])
+  v = evaluate(_dept_snap('2026-10', [_ditem('4.1.6', files)]), prev, NOW)
+  assert v['items'][0]['status'] == STATUS_UPDATED, v['items'][0]
+  # 无上期 → 基线（无期号时才允许）
+  v = evaluate(_dept_snap('2026-10', [_ditem('4.1.6', files)]), None, NOW)
+  assert v['items'][0]['status'] == STATUS_BASELINE, v['items'][0]
+
+
+def test_dept_flat_read_side_period_recover():
+  """旧快照的空期号在读侧按「目录年份 + 文件名月份」补算（不重跑即可自愈）。"""
+  path = '2.2.8视频监控录像查询记录单 / 2026年输出物'
+  raw = {'fid': 'f1', 'file_name': '视频监控录像查询记录单（十月）.pdf',
+         'path': path, 'period': ''}
+  # 期间 2026-10：十月文件算本期已交（老快照 period_source 为空 → 读侧标 'name'）
+  latest = _dept_snap('2026-10', [_ditem('2.2.8', [dict(raw)], period_source='')])
+  item = evaluate(latest, None, NOW)['items'][0]
+  assert item['status'] == STATUS_UPDATED, item
+  assert item['latest_period'] == '2026-10', item
+  assert item['period_source'] == 'name', item
+  assert item['files'][0]['period'] == '2026-10', item['files']
+  assert item['files'][0]['status'] == STATUS_UPDATED, item['files']
+  # 期间 2026-11：仍是未更新，但最新期号能读出来了
+  latest = _dept_snap('2026-11', [_ditem('2.2.8', [dict(raw)], period_source='')])
+  item = evaluate(latest, None, NOW)['items'][0]
+  assert item['status'] == STATUS_STALE, item
+  assert item['latest_period'] == '2026-10', item
+  assert item['files'][0]['status'] == STATUS_STALE, item['files']
+  # 目录链没有年份 → 补不出来，维持原 fid/基线口径
+  no_year = dict(raw, path='2.2.8视频监控录像查询记录单')
+  item = evaluate(_dept_snap(
+    '2026-10', [_ditem('2.2.8', [no_year], period_source='')]),
+    None, NOW)['items'][0]
+  assert item['status'] == STATUS_BASELINE, item
+  assert item['period_source'] == '', item
+  assert item['files'][0]['period'] == '', item['files']
+  # 查更新项不受影响：期号为空也照旧按 sha256 判
+  prev = _dept_snap('2026-09', [_ditem('6.3.1', [dict(raw, sha256='old')],
+                                       judge='update', layout='flat')])
+  cur = _dept_snap('2026-10', [_ditem('6.3.1', [dict(raw, sha256='new')],
+                                     judge='update', layout='flat')])
+  item = evaluate(cur, prev, NOW)['items'][0]
+  assert item['status'] == STATUS_UPDATED, item
+  assert item['files'][0]['period'] == '', item['files']
+
+
+def test_dept_flat_period_from_llm():
+  latest = _dept_snap('2026-11', [_ditem(
+    '4.1.6', [_pfile('f1', '2026-10')], latest_period='2026-10',
+    period_source='llm')])
+  v = evaluate(latest, None, NOW)
+  assert v['items'][0]['period_source'] == 'llm'
+  assert v['items'][0]['status'] == STATUS_STALE
+
+
+def test_dept_update_item_still_hash_compared():
+  """查更新项不受影响：照旧按 sha256 比上一期。"""
+  prev = _dept_snap('2026-09', [_ditem('6.3.1', [_file('f1', 'old')],
+                                       judge='update', layout='flat')])
+  latest = _dept_snap('2026-10', [_ditem('6.3.1', [_file('f1', 'new')],
+                                         judge='update', layout='flat')])
+  v = evaluate(latest, prev, NOW)
+  assert v['items'][0]['status'] == STATUS_UPDATED, v['items'][0]
+
+
+def test_dept_flipped_update_judged_by_period():
+  """线上更新项按部门改判为查新增：快照存 judge=new + layout=flat + 期号 → 纯按期判。"""
+  latest = _dept_snap('2026-11', [_ditem(
+    '6.3.1', [_pfile('f1', '2026-10'), _pfile('f2', '2026-09')],
+    judge='new', layout='flat', latest_period='2026-10', expected='2026-11',
+    pending_files=['人员排班计划表（10月）.xlsx'])])
+  item = evaluate(latest, None, NOW)['items'][0]
+  assert item['status'] == STATUS_STALE, item
+  assert item['judge'] == 'new', item
+  assert item['latest_period'] == '2026-10', item
+  # pending_files 只展示，不改状态；去重保序透出
+  assert item['pending_files'] == ['人员排班计划表（10月）.xlsx'], item
+
+
+def test_dept_pending_files_empty_for_old_snapshots():
+  """老快照没有 pending_files 字段 → 空数组，不报错。"""
+  item = {'seq': 1, 'number': '6.3.1', 'name': 'X', 'cadence': '月度', 'note': '',
+          'judge': 'update', 'layout': 'flat', 'expected_period': '2026-10',
+          'latest_period': '', 'period_source': '', 'matched_count': 1,
+          'files': [_file('f1', 'aaa')], 'error': ''}
+  got = evaluate(_dept_snap('2026-10', [item]), None, NOW)['items'][0]
+  assert got['pending_files'] == [], got
+
+
+def test_dept_review_when_uncertain_candidates():
+  """确定性匹配为空 + 模型无法确定归属 → 待复核（不当已命中，file_count 仍 0）。"""
+  review = [{'fid': 'r1', 'topic': '字节IT库房应急卡领取登记记录表.pdf'}]
+  item = _ditem('2.3.2.6', [], review_files=review)
+  v = evaluate(_dept_snap('2026-11', [item]), None, NOW)
+  got = v['items'][0]
+  assert got['status'] == STATUS_REVIEW, got
+  assert got['status_label'] == '待复核'
+  assert got['file_count'] == 0, got
+  # 老快照存文件对象 → 读取时归一成文件名（前端契约是 string[]）
+  assert got['review_files'] == ['字节IT库房应急卡领取登记记录表.pdf'], got
+  assert got['error'] and '待人工确认' in got['error'], got
+  assert v['counts'][STATUS_REVIEW] == 1
+  assert v['counts'][STATUS_UPDATED] == 0
+
+
+def test_dept_review_accepts_name_list():
+  """新快照直接存文件名：原样透出（strip、去重），不重复、不变对象。"""
+  review = [' 疑似.pdf ', '疑似.pdf', '', '另一份.pdf']
+  v = evaluate(_dept_snap('2026-11', [_ditem('2.3.2.6', [], review_files=review)]), None, NOW)
+  got = v['items'][0]
+  assert got['status'] == STATUS_REVIEW, got
+  assert got['review_files'] == ['疑似.pdf', '另一份.pdf'], got
+
+
+def test_dept_missing_without_review_files():
+  """没有疑似文件仍判「未找到」，不硬凑待复核。"""
+  v = evaluate(_dept_snap('2026-11', [_ditem('2.3.2.6', [])]), None, NOW)
+  got = v['items'][0]
+  assert got['status'] == STATUS_MISSING, got
+  assert got['review_files'] == [], got
+  assert v['counts'][STATUS_REVIEW] == 0
+
+
+def test_summary_mentions_review_only_when_present():
+  review = [{'fid': 'r1', 'topic': '疑似.pdf'}]
+  v = evaluate(_dept_snap('2026-11', [_ditem('2.3.2.6', [], review_files=review)]), None, NOW)
+  assert '待复核 1' in summary_text(v), summary_text(v)
+  v2 = evaluate(_dept_snap('2026-11', [_ditem('2.3.2.6', [])]), None, NOW)
+  assert '待复核' not in summary_text(v2), summary_text(v2)
+
+
+def test_dept_cross_year_2027():
+  """跨年：1 月期间不能被 2026-12 的文件蒙混成已交。"""
+  now = datetime(2027, 1, 5, tzinfo=timezone.utc)
+  latest = _dept_snap('2027-01', [_ditem(
+    '4.1.6', [_pfile('f1', '2026-12'), _pfile('f2', '2027-01')],
+    latest_period='2027-01', expected='2027-01')], taken_at=now)
+  item = evaluate(latest, None, now)['items'][0]
+  assert item['status'] == STATUS_UPDATED, item
+  # 上年 12 月的 f1 不列出（本期/最新一期裁剪），但匹配数仍含它
+  status = {f['fid']: f['status'] for f in item['files']}
+  assert status == {'f2': STATUS_UPDATED}, status
+  assert item['file_count'] == 1 and item['matched_count'] == 2, item
+
+
+def test_dept_cross_year_2027_stale():
+  """只有上年 12 月文件时判未更新；应到期按快照期间重算，不读库里旧值。"""
+  now = datetime(2027, 1, 5, tzinfo=timezone.utc)
+  latest = _dept_snap('2027-01', [_ditem(
+    '4.1.6', [_pfile('f1', '2026-12')], latest_period='2026-12',
+    expected='2026-12')], taken_at=now)
+  item = evaluate(latest, None, now)['items'][0]
+  assert item['status'] == STATUS_STALE, item
+  assert item['expected_period'] == '2027-01', item['expected_period']
 
 
 def main() -> int:

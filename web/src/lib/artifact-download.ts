@@ -8,9 +8,15 @@ function extOf(name: string): string {
   return i >= 0 ? name.slice(i + 1).toLowerCase() : '';
 }
 
-/** 下载产物（带 token）；.html 产物前置内联 echarts，避免下载后图表空白 */
-export async function downloadArtifact(rel: string, name: string): Promise<void> {
-  const resp = await client.get(rel, { responseType: 'blob' });
+/** 下载产物（带 token）；.html 产物前置内联 echarts，避免下载后图表空白。
+ *  `timeout` 不传时沿用 client 默认值（30s）。 */
+export async function downloadArtifact(
+  rel: string, name: string, timeout?: number,
+): Promise<void> {
+  const resp = await client.get(rel, {
+    responseType: 'blob',
+    ...(timeout ? { timeout } : {}),
+  });
   let blob: Blob = resp.data;
   if (HTML_EXT.includes(extOf(name))) {
     const html = await resp.data.text();

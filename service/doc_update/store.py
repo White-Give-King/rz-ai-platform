@@ -66,7 +66,12 @@ def _clean(doc: dict | None) -> dict | None:
 
 
 async def latest() -> dict | None:
-  docs = await _coll().find({}).sort('taken_at', -1).limit(1).to_list(1)
+  """默认展示的「最新一期」：先按期号、再按采集时间。
+
+  补跑旧期会把 `taken_at` 刷成最新，按采集时间排会让 10 月顶掉 11 月。
+  """
+  docs = (await _coll().find({}).sort([('period_key', -1), ('taken_at', -1)])
+          .limit(1).to_list(1))
   return _clean(docs[0]) if docs else None
 
 
@@ -104,6 +109,24 @@ async def list_periods() -> list[dict]:
   ]
   docs = await _coll().aggregate(pipeline).to_list(None)
   return [_aware(doc) for doc in docs]
+
+
+async def legacy_periods() -> list[dict]:
+  """旧版单树快照（没有 `depts` 字段）——部门口径之前的历史，页面无法按部门过滤。"""
+  docs = await (_coll().find(
+    {'depts': {'$exists': False}},
+    {'_id': 0, 'period_key': 1, 'period_label': 1, 'taken_at': 1},
+  ).sort('period_key', -1).to_list(None))
+  return [_aware(doc) for doc in docs]
+
+
+async def drop_legacy(period_key: str = '') -> int:
+  """删掉旧版单树快照。**只匹配 `depts` 字段不存在的文档**，部门口径快照删不到。"""
+  query: dict = {'depts': {'$exists': False}}
+  if period_key:
+    query['period_key'] = period_key
+  result = await _coll().delete_many(query)
+  return int(result.deleted_count)
 
 
 async def save(snapshot: dict, created_by: str = '') -> str:

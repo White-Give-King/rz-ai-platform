@@ -64,6 +64,15 @@ async def _tool_call_count(start: datetime, end: datetime) -> int:
   return total
 
 
+async def _report_run_count(start: datetime, end: datetime) -> int:
+  """区间内生成成功的统计分析报告份数（预设报告 run，期号 key 以工单类型开头）。"""
+  return await mongodb_manager.db.scheduled_task_runs.count_documents({
+    'preset_key': {'$regex': '^(event|breakdown|change|question|threshold)__'},
+    'status': 'success',
+    'triggered_at': {'$gte': start, '$lte': end},
+  })
+
+
 @router.get('/stats/overview')
 async def get_overview(request: Request):
   """返回仪表盘概览统计（本周数据 + 较上周变化）。"""
@@ -106,6 +115,8 @@ async def get_overview(request: Request):
   video_t, video_l = await _count('video_tasks')
   risk_t, risk_l = await _count('risk_checks', 'checked_at')
   fire_t, fire_l = await _count('llm_usage', extra={'caller': 'fire_safety'})
+  report_t = await _report_run_count(this_start, this_end)
+  report_l = await _report_run_count(last_start, last_end)
 
   # 「API 调用总量」= Agent 的工具/平台 API 调用次数。
   # 口径变更（2026-09-28）：原先是 msg + video + risk + fire 相加 —— 把「消息条数
@@ -137,6 +148,8 @@ async def get_overview(request: Request):
       'risk_check_change': _pct_change(risk_t, risk_l),
       'fire_safety_count': fire_t,
       'fire_safety_change': _pct_change(fire_t, fire_l),
+      'report_count': report_t,
+      'report_change': _pct_change(report_t, report_l),
       'doc_count': doc_count,
     },
   }

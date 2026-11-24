@@ -217,7 +217,10 @@ export default function ChatInput({ suggestions }: ChatInputProps) {
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
+            // 中文输入法选词时也会收到 Enter：组合态下不能发送，否则半截拼音/候选会直接发出去。
+            // isComposing 在部分浏览器不可靠，keyCode 229 是 IME 组合态的兜底判据。
+            if (e.key === 'Enter' && !e.shiftKey
+              && !e.nativeEvent.isComposing && e.keyCode !== 229) {
               e.preventDefault();
               handleSend();
             }
@@ -264,6 +267,7 @@ export default function ChatInput({ suggestions }: ChatInputProps) {
         {isStreaming ? (
           <button
             onClick={stopStreaming}
+            title="停止生成"
             className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground transition-opacity hover:opacity-90"
             aria-label="停止"
           >
@@ -272,6 +276,8 @@ export default function ChatInput({ suggestions }: ChatInputProps) {
         ) : (
           <button
             onClick={() => handleSend()}
+            // disabled 元素上 tooltip 不触发，用原生 title 说明为什么不能发
+            title={text.trim() ? '发送' : '请输入内容后再发送'}
             className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-40"
             disabled={!text.trim()}
             aria-label="发送"

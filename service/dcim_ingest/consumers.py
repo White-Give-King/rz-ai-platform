@@ -241,8 +241,14 @@ class TopicConsumer(threading.Thread):
         if attempt >= _DB_MAX_RETRY:
           raise
         time.sleep(2 * attempt)
-    consumer.commit(asynchronous=False)
+    # 先计数再提交：提交可能因 rebalance / 位移失效而失败，但此刻数据**已经写成功**。
+    # 原先计数在提交之后，一失败就不加 —— 日志显示「累计 0」而库里其实有数据，极难排查。
     self.total += len(buf)
+    try:
+      consumer.commit(asynchronous=False)
+    except Exception as e:  # noqa: BLE001 —— 必须明确归类：写入成功、位移没提交
+      logger.warning('[%s] 写入成功但提交位移失败（这批 %d 条将重放）: %s', self.label, len(buf), e)
+      raise
     logger.info(
       '[%s] 落库 %d 条 用时 %.2fs（累计 %d）',
       self.label, len(buf), time.time() - t0, self.total,
@@ -463,8 +469,13 @@ class RealtimeConsumer(TopicConsumer):
         if attempt >= _DB_MAX_RETRY:
           raise
         time.sleep(2 * attempt)
-    consumer.commit(asynchronous=False)
+    # 先计数再提交（理由同基类）：提交失败时数据已落库，计数不该归零
     self.total += len(buf)
+    try:
+      consumer.commit(asynchronous=False)
+    except Exception as e:  # noqa: BLE001 —— 写入成功、位移没提交，这批会重放
+      logger.warning('[%s] 写入成功但提交位移失败（这批 %d 行将重放）: %s', self.label, len(buf), e)
+      raise
     st1 = int(getattr(store, 'statements', 0)) + int(getattr(store, 'pue_statements', 0))
     statements = max(0, st1 - st0)
     ratio = (f' 行/语句={len(buf) / statements:.1f}' if statements else '')

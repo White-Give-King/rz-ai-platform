@@ -6,7 +6,7 @@
     （根节点删了树就断，`query_space_tree` 从顶层递归再也到不了 A1），
     以及落在这些空间/idc 下的设备、点位。
   - 全清：dcim_alarms / dcim_alarms_history / dcim_alarm_orders /
-    dcim_alarm_orders_history / dcim_incident_reports / dcim_dlq。
+    dcim_alarm_orders_history / dcim_incident_reports / dcim_change_reports / dcim_dlq。
   - 不动：TDengine 时序数据；`dcim_td_column` / `dcim_td_stable`（列映射清了，
     重新分配不保证与旧列一致 → 旧行会被读成别的测点）；`dcim_level_rule`（配置）。
 
@@ -48,6 +48,7 @@ TRUNCATE_TABLES = (
   'dcim_alarm_orders',
   'dcim_alarm_orders_history',
   'dcim_incident_reports',
+  'dcim_change_reports',
   'dcim_dlq',
 )
 

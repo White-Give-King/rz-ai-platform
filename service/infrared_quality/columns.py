@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 COLUMNS = [
   '序号', '公司', '部门', '巡检任务', '巡检人', '设备类型', '设备名称',
   '设备编号', '安装位置', '检测时间', '最高温度', '上限值', '判定',
-  '模型分数', '说明', '图片链接',
+  '置信度', '说明', '图片链接',
 ]
 
 _TZ = timezone(timedelta(hours=8))
@@ -44,7 +44,7 @@ def build_row(*, seq: int, company: str, dept: str, task_id: str, inspector: str
     '最高温度': max_temp,
     '上限值': upper,
     '判定': verdict,
-    '模型分数': '' if score is None else str(score),
+    '置信度': '' if score is None else str(score),
     '说明': note,
     '图片链接': picture,
   }

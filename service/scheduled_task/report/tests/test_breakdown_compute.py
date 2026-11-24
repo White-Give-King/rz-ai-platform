@@ -204,7 +204,7 @@ def test_dept_distribution():
   assert '5 单' in s['kpi']['dept_top']['sub'], s['kpi']['dept_top']
   assert '2 个部门' in s['kpi']['dept_top']['sub'], s['kpi']['dept_top']
   s2 = compute_stats(_fixture().drop(columns=['dc']), pd.DataFrame(), _WINDOW)
-  assert s2['dept'] == {'rows': [], 'classes': 0}, s2['dept']
+  assert s2['dept'] == {'rows': [], 'classes': 0, 'min_n': 3}, s2['dept']
   assert s2['kpi']['dept_top']['value'] == '—', s2['kpi']['dept_top']
 
 
@@ -216,6 +216,35 @@ def test_dept_mom_delta():
   assert rows['A分部']['prev'] == 2 and rows['A分部']['delta'] == 3, rows['A分部']
   assert rows['B分部']['prev'] == 4 and rows['B分部']['delta'] == -1, rows['B分部']
   assert rows['C分部']['count'] == 0 and rows['C分部']['delta'] == -1, rows['C分部']
+
+
+def test_dept_duration_compare():
+  """部门处理时长（第 7 章）：单期有效样本 <3 不给 P50/P90（也不判方向），但单量行照留。
+
+  夹具本期：A分部 5 单（p50=30）、B分部 3 单（p50=15）；本期无 C分部。
+  上期：A分部 3 单（p50=200）、B分部 2 单（不足）、C分部 3 单（p50=60）。
+  """
+  prev = pd.DataFrame({
+    'dc': ['A分部'] * 3 + ['B分部'] * 2 + ['C分部'] * 3,
+    'faultHandlingTime': [_mins(100), _mins(200), _mins(300),
+                          _mins(10), _mins(20),
+                          _mins(50), _mins(60), _mins(70)],
+  })
+  s = compute_stats(_fixture(), prev, _WINDOW)
+  assert [r['name'] for r in s['dept']['rows']] == ['A分部', 'B分部', 'C分部'], s['dept']['rows']
+  rows = {r['name']: r for r in s['dept']['rows']}
+  # A分部：两期都有 ≥3 样本 → 差值 30 - 200 = 下降 170 分钟
+  a = rows['A分部']
+  assert (a['n_valid'], a['p50'], a['prev_p50'], a['p50_delta']) == (5, 30.0, 200.0, -170.0), a
+  # B分部：上期仅 2 单 → 上期无同期数据，不给趋势
+  b = rows['B分部']
+  assert (b['n_valid'], b['p50'], b['prev_p50'], b['p50_delta']) == (3, 15.0, None, None), b
+  # C分部：本期 0 单（本期时长无值）→ 行仍在（union），上期有值但本期缺 → 差值为 None
+  c = rows['C分部']
+  assert (c['count'], c['p50'], c['prev_p50'], c['p50_delta']) == (0, None, 60.0, None), c
+  # 缺 `faultHandlingTime` 列 → 时长列整体不可得（不崩），单量行仍在
+  s2 = compute_stats(_fixture().drop(columns=['faultHandlingTime']), pd.DataFrame(), _WINDOW)
+  assert all(r['p50'] is None and r['p50_delta'] is None for r in s2['dept']['rows']), s2['dept']
 
 
 def test_park_level_matrix():

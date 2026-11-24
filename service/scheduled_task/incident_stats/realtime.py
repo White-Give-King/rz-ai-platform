@@ -20,6 +20,7 @@ import logging
 import time
 
 from config.settings import settings
+from service.scheduled_task.change_notice import source as change_source
 from service.scheduled_task.incident_stats import extract, feishu, schema, source, sync
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,13 @@ def should_ingest(chat_id: str) -> bool:
   return bool(chat_id) and chat_id in ingest_chat_ids()
 
 
+def is_bot_sender(sender_type: str, open_id: str, app_id: str) -> bool:
+  """飞书发送者是否机器人：`sender_type=app`，或没给 type 但只有 app_id。"""
+  if (sender_type or '').strip().lower() == 'app':
+    return True
+  return bool(app_id) and not open_id
+
+
 def on_message_event(event) -> None:
   """WS 线程内调用：只做轻量取值，其余交回主 loop。绝不抛。"""
   from service.feishu.client import submit_async
@@ -61,12 +69,15 @@ def on_message_event(event) -> None:
     chat_id = getattr(message, 'chat_id', '') or ''
     if not should_ingest(chat_id):
       return
-    sender = getattr(getattr(event.event, 'sender', None), 'sender_id', None)
+    sender = getattr(getattr(event, 'event', None), 'sender', None)
+    sender_id = getattr(sender, 'sender_id', None)
     submit_async(_ingest_one(
       chat_id=chat_id,
       message_id=getattr(message, 'message_id', '') or '',
       create_s=feishu._to_seconds(getattr(message, 'create_time', None)),
-      open_id=(getattr(sender, 'open_id', '') or getattr(sender, 'user_id', '') or ''),
+      open_id=(getattr(sender_id, 'open_id', '') or getattr(sender_id, 'user_id', '') or ''),
+      app_id=getattr(sender_id, 'app_id', '') or '',
+      sender_type=getattr(sender, 'sender_type', '') or '',
       msg_type=getattr(message, 'message_type', '') or '',
       content=getattr(message, 'content', '') or '',
     ))
@@ -88,9 +99,15 @@ def on_recall_event(chat_id: str, message_id: str) -> None:
 
 
 async def _delete_one(*, chat_id: str, message_id: str) -> None:
-  """删掉被撤回的那一行。删 0 行也正常（消息可能本就不在库里）。"""
+  """删掉被撤回的那一行。删 0 行也正常（消息可能本就不在库里）。
+
+  日常运维群的行在 `dcim_change_reports`，应急群在 `dcim_incident_reports` —— 按
+  已解析的园区映射判（应急优先），与 `_ingest_one` 同口径。
+  """
+  is_change = not await _cluster_of(chat_id) and feishu.is_change_chat(chat_id)
+  target = change_source if is_change else source
   try:
-    deleted = await asyncio.to_thread(source.delete_report, chat_id, message_id)
+    deleted = await asyncio.to_thread(target.delete_report, chat_id, message_id)
   except Exception as e:
     logger.warning('[Incident] 删除撤回消息失败 chat=%s msg=%s: %s', chat_id, message_id, e)
     return
@@ -98,14 +115,25 @@ async def _delete_one(*, chat_id: str, message_id: str) -> None:
 
 
 async def _ingest_one(*, chat_id: str, message_id: str, create_s: int | None,
-                      open_id: str, msg_type: str, content: str) -> None:
-  """一条 WS 消息 → 一行入库；只有 sos/first 触发去抖匹配。"""
+                      open_id: str, app_id: str = '', sender_type: str = '',
+                      msg_type: str, content: str) -> None:
+  """一条 WS 消息 → 一行入库；只有 sos/first 触发去抖匹配。
+
+  日常运维群按群身份路由到 `dcim_change_reports`（应急园区映射命中时仍按应急处理）；
+  机器人（`sender_type=app`）发在日常群的消息**不入库**，应急群不受影响。
+  """
   if not message_id or create_s is None:
     return
   text = feishu.text_from_content(msg_type, content).strip()
   if not text:
     logger.debug('[Incident] 实时消息无文本，跳过 chat=%s msg=%s type=%s',
                  chat_id, message_id, msg_type)
+    return
+  # 园区（= cluster）：匹配与统计都按它分组，映射取自 INCIDENT_FEISHU_PARK_CHATS
+  park = await _cluster_of(chat_id)
+  is_change = not park and feishu.is_change_chat(chat_id)
+  if is_change and is_bot_sender(sender_type, open_id, app_id):
+    logger.info('[ChangeNotice] 跳过机器人消息 chat=%s msg=%s', chat_id, message_id)
     return
   row = feishu.build_report_row(
     chat_id=chat_id,
@@ -118,8 +146,18 @@ async def _ingest_one(*, chat_id: str, message_id: str, create_s: int | None,
     text=text,
     raw_body=content,
   )
-  # 园区（= cluster）：匹配与统计都按它分组，映射取自 INCIDENT_FEISHU_PARK_CHATS
-  row['cluster'] = await _cluster_of(chat_id) or None
+  if is_change:
+    # 日常运维群：只进变更表，不补抽、不触发告警匹配（应急群优先，园区映射命中即走上面路径）
+    try:
+      await asyncio.to_thread(change_source.save_reports, [row])
+    except Exception as e:
+      logger.warning('[ChangeNotice] 实时入库失败 chat=%s msg=%s: %s',
+                     chat_id, message_id, e)
+      return
+    logger.info('[ChangeNotice] 实时入库 chat=%s msg=%s kind=%s',
+                chat_id, message_id, row['kind'])
+    return
+  row['cluster'] = park or None
   # 确定性解析没拿到发生时间/告警值时让模型补一次（单条上限 1 次，失败照常入库）
   await extract.enrich_rows([row], max_calls=1)
   try:
@@ -249,12 +287,20 @@ async def start() -> None:
   except Exception as e:
     # 表多半已存在（同步/CLI 建过），不因此拒绝启动
     logger.warning('[Incident] 实时入库建表检查失败: %s', e)
+  try:
+    await asyncio.to_thread(schema.ensure_change_schema, settings.DCIM_PG_DSN)
+  except Exception as e:
+    logger.warning('[ChangeNotice] 变更表建表检查失败: %s', e)
 
   await _refresh_cluster_cache()
-  missing = [c for c in chats if c not in _cluster_cache]
+  change_chats = feishu._change_chat_ids()
+  missing = [c for c in chats if c not in _cluster_cache and c not in change_chats]
   if missing:
     logger.warning('[Incident] 以下入库白名单群没有园区映射（INCIDENT_FEISHU_PARK_CHATS），'
                    '能入库但配不上告警: %s', missing)
+  overlap = [c for c in change_chats if c in _cluster_cache]
+  if overlap:
+    logger.warning('[Incident] 以下群同时配置在应急群与日常运维群里，按应急处理: %s', overlap)
   outside = [c for c in _cluster_cache if c not in chats]
   if outside:
     logger.warning('[Incident] 园区映射里的群不在入库白名单（FEISHU_GROUP_INGEST_CHATS），'
@@ -268,8 +314,10 @@ async def start() -> None:
     logger.warning('[Incident] 未配置 INCIDENT_FEISHU_PARK_CHATS，跳过断线补偿循环')
   # 实时入库开启而 INCIDENT_STATS_ENABLED 关闭时，由这里启动卡片进展回捞（幂等）
   await sync.start_card_refresh()
-  logger.info('[Incident] 飞书群实时入库已启用：%d 个群，补偿窗口 %d 分钟',
-              len(chats), settings.FEISHU_GROUP_INGEST_BACKFILL_MINUTES)
+  logger.info('[Incident] 飞书群实时入库已启用：%d 个群（其中日常运维群 %d 个），'
+              '补偿窗口 %d 分钟',
+              len(chats), len(change_chats & set(chats)),
+              settings.FEISHU_GROUP_INGEST_BACKFILL_MINUTES)
 
 
 async def stop() -> None:

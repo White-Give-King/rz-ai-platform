@@ -554,6 +554,16 @@ async def analysis_load(
   if caller is None:
     return json.dumps({'error': f'能力 {cap_id} 无可用后端'}, ensure_ascii=False)
 
+  # 未声明参数明确报错：params 原样透传给 caller，绕过工具 schema 校验。静默丢弃
+  # 会把「传错参数名」变成「按无参数全表扫」（实测传 date 给告警能力捞出 295 万条）。
+  unknown = sorted(set(params or {}) - set(cap.params or {}))
+  if unknown:
+    return json.dumps({
+      'error': f'不支持的参数：{", ".join(unknown)}',
+      'suggestion': f'能力 {cap_id} 支持的参数：{", ".join(cap.params or {}) or "无"}；'
+                    '请按这些参数名重试。',
+    }, ensure_ascii=False)
+
   max_rows = settings.AGENT_ANALYSIS_MAX_ROWS
   page_size = settings.AGENT_ANALYSIS_PAGE_SIZE
 
@@ -679,6 +689,8 @@ async def analysis_exec(
   如需生成可下载的产物文件（CSV/Excel/图表图片/PPT/PDF），在代码里把文件写到
   当前目录（如 df.to_csv('xxx.csv')、fig.savefig('xxx.png')），工具会自动回传，
   返回的 artifacts 列表里每条有 url 和 name——组装 <file url="..." name="..."/>
+  **Excel 若要某列按颜色词上色**（如「标识颜色」列写 绿/橙/红/紫），用沙箱预置的
+  `rz_excel(df, '报告.xlsx', color_columns=['列名'])`，别手写 openpyxl 样式。
   标签时原样引用，禁止改写。**若只是把数据集整理成“右侧交互列表”的视图，文件必须固定命名
   view.csv（会被自动剔除、不作为下载产物），不要另存成别的 .csv 当交付。**
   **图片产物必须真实画出内容**：空数据画空画布、

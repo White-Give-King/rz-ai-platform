@@ -1,9 +1,10 @@
 """综合管理平台能力数据（真实接口，Phase 2）。
 
-50 条能力（32 条单接口经联调核实可用、且当前需求内；另 3 条接口文档登记待实测；
-还有 15 条组合能力 query_my_info / query_pen_company_dept / query_event_ticket /
-query_pending_ticket / query_change_ticket / query_breakdown_ticket /
-query_question_ticket / query_threshold_ticket / query_supplier_ticket /
+56 条能力（38 条单接口一一映射、经联调核实可用；另 18 条组合能力 query_my_info /
+query_pen_company_dept / query_event_ticket / query_pending_ticket / query_change_ticket /
+query_breakdown_ticket / query_question_ticket / query_threshold_ticket /
+query_supplier_ticket / query_change_statistics / query_equipment_maintenance_flow /
+query_drill_plans /
 query_breakdown_ticket_detail / query_question_ticket_detail / query_event_ticket_detail /
 query_change_ticket_detail / query_supplier_ticket_detail / query_threshold_ticket_detail，
 均已实测）：
@@ -60,6 +61,9 @@ query_change_ticket_detail / query_supplier_ticket_detail / query_threshold_tick
 - mgmt.query_task_list（查询任务列表，配置模板生成的任务工单）
 - mgmt.query_review_appointment（查询评审预约列表，变更工单审批前的评审会议预约）
 - mgmt.query_review_appointment_detail（查询评审预约详情，按列表 id 查单条预约）
+- mgmt.query_drill_plans（查询演练计划列表，组合能力：按部门+年份，可按 month/week/status/
+  finish_status/日期区间收窄 weeks[]，dept_id 可改传 dept_name+park 由服务端按公司解析）
+- mgmt.query_drill_week（查询演练周明细，按周 id 查起止/完成状态/四班组记录文件）
 
 其余接口（部门树/隐患/周报等）已全部移除——既有平台侧 bug、又不在当前
 需求范围，保留只会让 agent 选错工具。设备信息接口按需新接入，见 query_device_info。
@@ -86,8 +90,8 @@ id 后再查单张工单明细。与 query_inspection_list（巡检执行记录�
 query_equipment_maintenance_plan 为
 'maintenance'：设备维护计划/维护进度相关查询 promote 它（对方平台两套叫法是同一接口）；
 deptId 优先按用户问题中的部门
-经 query_dept_by_name 解析，未指明默认当前登录用户所属部门（ownDeptId，服务账号
-回退技术保障部）并告知用户。
+先确定公司（query_company_list 按园区名定位 → query_dept_list(company_id)）再解析，
+未指明默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部）并告知用户。
 query_equipment_maintenance_status 亦为 'maintenance'：维护计划状态概览查询 promote
 它，与明细列表（query_equipment_maintenance_plan）联动。
 query_equipment_work_order 亦为 'maintenance'：设备维护工单/执行记录查询 promote 它，
@@ -99,8 +103,8 @@ query_equipment_maintenance_flow / query_equipment_maintenance_flow_detail 亦�
 用列表返回的 rows[].id 查；与计划、工单三者的分工——流程查操作步骤模板、计划查
 安排与执行进度、工单查实际执行记录。
 query_device_info 为 'device'：设备/台账相关查询 promote 它；dept_id 未指明默认
-当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户指定部门时用
-query_dept_by_name 解析（区别于 maintenance 的默认兜底）。
+当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户指定部门时先确定公司
+（query_company_list → query_dept_list）再解析（区别于 maintenance 的默认兜底）。
 query_infrared_device_type / query_infrared_device_list / query_infrared_detect_device
 亦为 'device'：红外温度检测相关查询 promote 它们。三者链路——
 query_infrared_device_type 红外设备类型（4 种，带默认温度上限）→
@@ -170,6 +174,14 @@ query_review_appointment_detail 亦为 'review'：评审预约详情查询 promo
 返回的 id 查单条预约完整详情，与 query_review_appointment（列表）联动。
 deptId/companyId 走服务账号默认部门/公司兜底，兜底时需告知用户默认查询范围；
 type/isAll 观察值可用，具体枚举含义待业务方核实。
+query_drill_plans / query_drill_week 为独立分类 'drill'：演练计划与演练周查询 promote
+它们。与代码内置工具 `drill_compliance_audit`（审查流水线：下载扫描件、OCR、比对 EOP）
+刻意分工——本组只查计划与安排，不下载、不解析记录文件内容。dept_id 未指明默认当前登录
+用户所属部门；指明部门名时传 dept_name(+park) 由服务端**按公司**解析（A1/A18 这类名称在
+多家公司同名，query_dept_by_name 只返回其中一条、会串到别家公司）；year 未传按当前年；
+问「本月/某月」传 month、「第 48 周」传 week、要已安排/未完成
+等传 status/finish_status、「11 月下旬」传日期区间，服务端按 weeks[] 收窄，避免全年约 50 周
+撑过工具输出上限、末尾计划被整条截断（也让模型不必在长 JSON 里靠眼睛找）。
 """
 
 from service.query.base.capability import Capability
@@ -242,10 +254,13 @@ CAPABILITIES: tuple[Capability, ...] = (
     id='mgmt.query_dept_by_name',
     name='按部门名称模糊查询部门',
     description=(
-      '按部门名称模糊查询综合管理平台的部门信息，返回匹配部门的 id、名称、'
-      '短名、父部门等。适用于「XX 是哪个部门」「技术保障部」等按部门名查部门的'
-      '场景；也是查询部门相关数据（如设备维护计划需传 deptId）的前置步骤——'
-      '按部门名解析出 deptId 后再传给对应工具。'
+      '按部门名称模糊查询综合管理平台的部门信息，返回匹配部门的 id、名称、短名、父部门等。'
+      '**限制：上游只返回同名部门中的一条**（实测 `A1` 返回的是海外园区 A1分部，该部门没有'
+      '任何演练计划），所以**不能用来跨公司解析 dept_id**——A1/A18/技术保障部这类名称在'
+      '润泽/海外/平湖/佛山/重庆多家公司同名。正确顺序是先 `query_company_list` 按园区名'
+      '（gardenName）确定公司，再 `query_dept_list(company_id)` 取该公司部门列表选 dept_id'
+      '（按公司隔离、天然区分同名部门）。本工具仅在名称全局唯一、公司已明确时兜底使用；'
+      '多个同名或与用户所指园区不一致时向用户确认，**不要猜**。'
     ),
     params={
       'dept_name': '部门名称关键字，必填，模糊匹配（如传「技术保障」能匹配「技术保障部」）',
@@ -467,8 +482,10 @@ CAPABILITIES: tuple[Capability, ...] = (
       '（roomTypeInfoList[].roomTypeName，含点位数 roomCount 与设备数 deviceCount）、'
       '楼层（floor）、审核权限（auditPermissions）等。适用于「巡检员名单」「XX 部门的'
       '巡检员/巡检人员」「这个班组有谁」「查某人的巡检资格/负责点位」等查询。'
-      '**本能力按部门查，dept_id 必填**：用户已说明公司/部门时，先用 query_dept_by_name '
-      '按部门名解析出 dept_id 再传入；**用户没说查哪个公司、哪个部门时，必须先问用户，'
+      '**本能力按部门查，dept_id 必填**：用户已说明公司/部门时，先确定公司——提到园区名'
+      '先用 query_company_list 按 gardenName 定位公司，再用 query_dept_list(company_id) '
+      '解析出 dept_id（A1 这类名称在多家公司同名，**不要**用 query_dept_by_name 跨公司解析）；'
+      '**用户没说查哪个公司、哪个部门时，必须先问用户，'
       '不要默认用本人所属部门**——要给用户列选项就先调 query_company_list 列出账号可见的'
       '公司（含园区名 gardenName），再用 query_dept_list 列出该公司的部门让用户挑。'
       'name（姓名）、phone（手机号）为模糊过滤：用户给了姓名或手机号就传对应那个，'
@@ -476,7 +493,7 @@ CAPABILITIES: tuple[Capability, ...] = (
       '返回里的 **size 是总条数**、pageSize 是每页条数（两个字段名容易读反，务必按此理解）。'
     ),
     params={
-      'dept_id': '部门 id，必填；用户指明部门时先用 query_dept_by_name 解析出 dept_id；用户未指明公司/部门时先问用户，不要默认本人部门（可先用 query_company_list / query_dept_list 列选项）',
+      'dept_id': '部门 id，必填；用户指明部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）；用户未指明公司/部门时先问用户，不要默认本人部门（可先用 query_company_list / query_dept_list 列选项）',
       'name': '巡检员姓名，可选；模糊匹配（如「王」）',
       'phone': '巡检员手机号，可选；模糊匹配（11 位或带 86 前缀均可）',
       'page': '页码，默认 1',
@@ -500,7 +517,8 @@ CAPABILITIES: tuple[Capability, ...] = (
       '「查某设备的维护计划」「设备维护进度」「维护进度/执行进度」「哪些维护项还没做/已完成」等'
       '查询。'
       '公司/组织（部门）处理规则：用户问题中明确了公司或组织时，优先按用户所指'
-      '查询——先用 query_dept_by_name 按部门名解析出 dept_id 传入；未指明时用'
+      '查询——先确定公司（query_company_list 按园区名定位 → query_dept_list(company_id)）'
+      '解析出 dept_id 传入；未指明时用'
       '默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），回复须明确'
       '告知默认查询的公司/部门，并提示用户可选择其他公司/组织。parent_group 按问题'
       '中的专业类别传（供配电/'
@@ -511,7 +529,7 @@ CAPABILITIES: tuple[Capability, ...] = (
       'query_person_maintenance_plan（按员工 uid 查该人员负责的维护工单）。'
     ),
     params={
-      'dept_id': '部门 id，可选；用户指明部门时从 query_dept_by_name 解析获取，未指明用当前登录用户所属部门（服务账号回退技术保障部）',
+      'dept_id': '部门 id，可选；用户指明部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id），未指明用当前登录用户所属部门（服务账号回退技术保障部）',
       'device_name': '设备名称，可选；用户明确问某类设备时才传（模糊匹配，如「消防」）',
       'parent_group': '维护专业类别：供配电 / 制冷 / 智能化，可选；不传查全部类别',
       'year': '年份，必填；不传用当前年份（如 2026）',
@@ -579,15 +597,16 @@ CAPABILITIES: tuple[Capability, ...] = (
       '「设备维护操作流程」「维护作业指导/操作步骤」「MOP」「某类设备的维护流程」'
       '（如「视频的维护流程」）等查询。name 为流程名称模糊匹配（如传「视频」命中'
       '视频安防监控系统相关流程），不传返回该部门全部流程。'
-      '**本能力按部门查询，dept_id 可切换**：用户指明了部门/分部时，先用 '
-      'query_dept_by_name 解析出 dept_id 再传入；**用户没要求就用默认的本人所属部门'
+      '**本能力按部门查询，dept_id 可切换**：用户指明了部门/分部时，先定公司（'
+      'query_company_list 按园区名定位 → query_dept_list(company_id)）解析出 dept_id '
+      '再传入；**用户没要求就用默认的本人所属部门'
       '（ownDeptId，服务账号回退技术保障部），但必须在回复里说明本次查的是哪个部门，'
       '并补一句"要看其他部门的流程告诉我部门名即可"**——不要让用户以为只有自己部门的数据。'
       '列表每条的 id（rows[].id）可传给 query_equipment_maintenance_flow_detail '
       '查该条流程的完整内容（作业条件/保障措施/仪器/回退方案等）。'
     ),
     params={
-      'dept_id': '部门 id，可选、可切换；用户指明部门/分部时先用 query_dept_by_name 解析出 dept_id 传入；不传默认当前登录用户所属部门（服务账号回退技术保障部），此时回复须告知用户查的是哪个部门并可换',
+      'dept_id': '部门 id，可选、可切换；用户指明部门/分部时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）再传入；不传默认当前登录用户所属部门（服务账号回退技术保障部），此时回复须告知用户查的是哪个部门并可换',
       'name': '流程名称关键字，可选（模糊匹配，如「视频」）；不传返回该部门全部流程',
       'page': '页码，默认 1',
       'page_size': '每页条数，默认 20',
@@ -624,13 +643,15 @@ CAPABILITIES: tuple[Capability, ...] = (
       '按部门分页查询综合管理平台的设备台账/设备信息，返回每台设备的名称、型号、厂商、'
       '设备类型、所属部门、专业组别（供配电/制冷/智能化）、负责人、关联状态、告警上限等。'
       '适用于「查一下 XX 部门的设备」「有哪些设备」「设备台账」「某类设备清单」等查询。'
-      'dept_id 必填：用户问题中明确了部门时，先用 query_dept_by_name 按部门名解析出 '
-      'dept_id 再传入；用户未指明部门时，默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部）。'
+      'dept_id 必填：用户问题中明确了部门时，先确定公司（query_company_list 按园区名定位 → '
+      'query_dept_list(company_id)）解析出 dept_id 再传入；用户未指明部门时，默认当前登录'
+      '用户所属部门（ownDeptId，服务账号回退技术保障部）。A1 这类名称在多家公司同名，'
+      '**不要**用 query_dept_by_name 跨公司解析。'
       'type_id 按问题中的设备类型传（可选，不传查该部门全部设备）。区别于 '
       'query_equipment_maintenance_plan（查设备维护计划/维保安排）。'
     ),
     params={
-      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户明确部门时先用 query_dept_by_name 解析',
+      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户明确部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）',
       'type_id': '设备类型 id，可选；用户明确问某类设备时才传',
       'page': '页码，默认 1',
       'page_size': '每页条数，默认 20',
@@ -649,10 +670,10 @@ CAPABILITIES: tuple[Capability, ...] = (
       '设备类型」「XX 类型的默认温度上限」等查询；也是查询红外设备列表'
       '（query_infrared_device_list）按类型过滤拿 infraredDeviceTypeId 的前置步骤。'
       'dept_id 必填：默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户明确'
-      '部门时先用 query_dept_by_name 解析。'
+      '部门时先确定公司（query_company_list 按园区名定位 → query_dept_list(company_id)）再解析。'
     ),
     params={
-      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部 23BaepxKklv），用户明确部门时先用 query_dept_by_name 解析',
+      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部 23BaepxKklv），用户明确部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）',
     },
     category='device',
     domain='device',
@@ -694,7 +715,7 @@ CAPABILITIES: tuple[Capability, ...] = (
       '本工具是红外温度检测的设备范围/关联状态一览。'
     ),
     params={
-      'dept_id': '部门 id，可选；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部 23BaepxKklv），用户明确部门时先用 query_dept_by_name 解析',
+      'dept_id': '部门 id，可选；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部 23BaepxKklv），用户明确部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）',
       'page': '页码，默认 1',
       'page_size': '每页条数，默认 10000（一次返回全部，与红外检测设备清单场景匹配）',
     },
@@ -710,11 +731,12 @@ CAPABILITIES: tuple[Capability, ...] = (
       '智能化）及其下挂的设备组（如嵌入式服务器、视频监控摄像机、消防主机等）。适用于'
       '「XX 部门有哪些设备专业/分组」「设备怎么分类的」「某专业下有哪些设备组」等查询；'
       '也是按设备分组细看设备信息的前置步骤——分组 typeId 即设备信息记录里的'
-      'parentGroupId。dept_id 必填：用户明确部门时先用 query_dept_by_name 按部门名'
-      '解析，未明确默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部）。'
+      'parentGroupId。dept_id 必填：用户明确部门时先确定公司（query_company_list 按园区名'
+      '定位 → query_dept_list(company_id)）再解析，未明确默认当前登录用户所属部门'
+      '（ownDeptId，服务账号回退技术保障部）。'
     ),
     params={
-      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户明确部门时先用 query_dept_by_name 解析',
+      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户明确部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）',
     },
     category='device',
     domain='device',
@@ -728,11 +750,12 @@ CAPABILITIES: tuple[Capability, ...] = (
       '系统等）及其下挂的二级子系统，节点含 id、名称、层级。适用于「XX 部门有哪些设备'
       '系统类型」「暖通系统下有哪些子系统」「设备系统树」「设备怎么按系统分类」等查询。'
       'dept_id 必填，默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部）；用户指明'
-      '部门时先用 query_dept_by_name 按部门名解析。树节点 id 即查询子系统列表'
+      '部门时先确定公司（query_company_list 按园区名定位 → query_dept_list(company_id)）再解析。'
+      '树节点 id 即查询子系统列表'
       '（query_device_logic_type）时需传的 pid，两者联动。'
     ),
     params={
-      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部 23BaepxKklv），用户明确部门时先用 query_dept_by_name 解析',
+      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部 23BaepxKklv），用户明确部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）',
     },
     category='device',
     domain='device',
@@ -827,7 +850,7 @@ CAPABILITIES: tuple[Capability, ...] = (
       '金蝶公司编码、**gardenName（园区名，如「廊坊园区」「平湖园区」）**等。适用于'
       '「有哪些公司」「XX 公司的全称/ID」「查其他公司的数据」等场景；也是获取 '
       'company_id 的来源——用户要查其他公司的数据时，先在这里拿到该公司的 company_id，'
-      '再结合 query_dept_by_name 按部门名解析 dept_id 后传给对应工具。**用户提到园区名'
+      '再用 query_dept_list 取该公司部门列表、选出 dept_id 后传给对应工具。**用户提到园区名'
       '（如「廊坊园区」）时，用本工具按 gardenName 找到对应公司**（如 廊坊园区=润泽科技'
       '发展有限公司），再继续查该公司的部门/人员。无需参数，返回账号可见的全部公司。'
     ),
@@ -847,14 +870,15 @@ CAPABILITIES: tuple[Capability, ...] = (
       '（结合 query_person_by_id / query_employee_ticket / query_person_inspection 等）。'
       '**可按专业筛选**：用户问「供配电/制冷/智能化专业的人」时传 profession（供配电/制冷/'
       '智能化/其他）。'
-      'dept_id 必填：用户明确部门时先用 query_dept_by_name 按部门名解析，未明确默认'
+      'dept_id 必填：用户明确部门时先确定公司（query_company_list 按园区名定位 → '
+      'query_dept_list(company_id)）再解析，未明确默认'
       '当前登录用户所属部门（ownDeptId，服务账号回退技术保障部）。区别于 '
       'query_person_by_name（按姓名跨部门模糊查人）。'
       '**仅单页明细**：每次调用返回一页（默认 20 条）；需要统计全量分布/汇总/占比'
       '（如「部门人员专业分布」）时，改用 analysis_load 物化全量后再聚合。'
     ),
     params={
-      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户明确部门时先用 query_dept_by_name 解析',
+      'dept_id': '部门 id，必填；默认当前登录用户所属部门（ownDeptId，服务账号回退技术保障部），用户明确部门时先定公司（query_company_list 按园区名定位 → query_dept_list 取 dept_id）',
       'profession': '专业，可选：供配电 / 制冷 / 智能化 / 其他',
       'page': '页码，默认 1',
       'page_size': '每页条数，默认 20',
@@ -869,11 +893,11 @@ CAPABILITIES: tuple[Capability, ...] = (
     description=(
       '查询综合管理平台某公司下（当前账号可见）的部门列表，返回每个部门的 id、名称、'
       '简称、父部门、状态等。适用于「XX 公司下有哪些部门」「有哪些分部」「某公司的部门'
-      '列表」「查部门 id」等查询；也是按部门查人员/设备/维护计划时解析 dept_id 的来源'
-      '（查其他公司的数据时先在这里拿部门 id）。company_id 可选，留空默认当前登录用户'
-      '所属公司（服务账号回退润泽科技）；查其他公司的部门时，先用 query_company_list 拿到'
-      '该公司的 company_id 再传入。区别于 query_dept_by_name（按部门名模糊搜索单个'
-      '部门）。'
+      '列表」「查部门 id」等查询。**这是解析 dept_id 的首选**：按公司隔离，天然区分跨公司'
+      '同名部门（A1分部在 5 家公司都有，名称接口只会返回其中一条）。用户提到园区名时，'
+      '先用 query_company_list 按 gardenName 找到公司，再把其 company_id 传入本工具选部门；'
+      'company_id 可选，留空默认当前登录用户所属公司（服务账号回退润泽科技）。区别于 '
+      'query_dept_by_name（按名称模糊搜索、只返回同名部门中的一条，仅作兜底）。'
     ),
     params={
       'company_id': '公司 id，可选；留空默认当前登录用户所属公司，查其他公司时先用 query_company_list 获取',
@@ -1466,6 +1490,85 @@ CAPABILITIES: tuple[Capability, ...] = (
     },
     category='review',
     domain='review',
+    kind='资源',
+  ),
+  Capability(
+    id='mgmt.query_drill_plans',
+    name='查询演练计划列表',
+    description=(
+      '按部门+年份查询综合管理平台的应急演练计划。返回**计划数组**，每条计划形如：'
+      '{"id":"…","name":"…","deptName":"…","drillSpecialityId":"…","weeks":[…]}；'
+      '每条 weeks[] 形如：{"id":"2CniQ6lvWC7","week":"48","stime":"2026-11-23",'
+      '"etime":"2026-11-29","month":11,"status":0,"fileStatus":"A,B,C,D",'
+      '"finishStatus":"1","percent":"0","remark":null}。'
+      '字段口径：status 0=已安排（该周有演练）/1=未安排；finishStatus 1=未开始（还没到该周）/'
+      '2=未完成/3=已完成（另 4=已逾期）；month 为自然月 1-12；week 是年内周次（字符串，仅作'
+      '编号，**日期一律读 stime/etime，别按周次推算**）；fileStatus 是已上传记录的班组'
+      '（逗号分隔如 "A,B,C,D"，空=都没交）；percent 是完成百分比；deptName 可用于向用户'
+      '说明查询范围。'
+      '**部门定位（先说范围）**：用户说「廊坊A1」这类「位置 + 部门名」时，传 '
+      'dept_name="A1" + park="廊坊"，**由服务端按公司解析** dept_id；也可自己先 '
+      'query_company_list 定位公司、query_dept_list(company_id) 取 dept_id 再传。'
+      'A1/A18/技术保障部这类名称在润泽/海外/平湖/佛山/重庆**多家公司同名**（A1分部 5 家都有），'
+      '**不要**自己用 query_dept_by_name 拼 dept_id——该接口只返回同名部门中的一条，实测 '
+      'A1 解析到海外园区且该部门没有任何计划。dept_id / dept_name / park 都不传时默认'
+      '当前登录用户所属部门（服务账号回退技术保障部），须告知用户默认范围；year 未传按当前年。'
+      '**问「本月/某月」必须传 month**——服务端按 weeks[].month 过滤，避免全年约 50 周把结果'
+      '撑过输出上限、末尾计划被整条截掉（只看得到第一个计划就是这个原因）；若返回提示结果'
+      '被截断，改用 month 逐月查询，**不要据此说「没有计划」**。'
+      '**默认只返回已安排周**（status=0）；问「哪些周没安排」才显式传 status=1。'
+      '另可按 week（年内周次，如 "48"）/ finish_status / start_date+end_date 收窄，'
+      '多个条件同时生效；日期区间按周的 stime/etime 与该区间重叠判断。'
+      '按名称定位具体演练传 plan_name（去空白子串匹配计划名，如「双路市电中断」）。'
+      '**「第 48 周」这类就直接传 week，不要自己在大段 JSON 里翻找周次**（模型只能靠注意力'
+      '近似匹配、没有检索工具，长列表里会漏会错）。筛不到的周不出现在 weeks[] 里（计划本身'
+      '保留），某计划 weeks 为空＝该范围内没有安排。'
+      '**返回 `{"plans": [], "note": "..."}` 时 note 是下一步指引**（部门/园区未确定、'
+      '名称没匹配上、或该部门无计划），须照 note 去做或原样转述给用户。'
+      '要某一周的明细（四班组记录文件）取 weeks[].id 再调 query_drill_week；'
+      '本工具只返回计划与安排，不下载、不解析记录文件内容。'
+    ),
+    params={
+      'dept_id': '部门 id，形如 23BaepxKklv（11 位字母数字串）；可留空——用户说部门名时'
+                 '改用 dept_name(+park) 让服务端按公司解析；都未指明默认当前登录用户所属部门'
+                 '（服务账号回退技术保障部）',
+      'dept_name': '部门名，可选（如 A1 / A1分部 / 技术保障部）；**不要**自己用 '
+                   'query_dept_by_name 跨公司拼 dept_id，A1 这类名称在多家公司同名',
+      'park': '园区名，可选（如 廊坊 / 平湖 / 惠州 / 佛山 / 重庆 / 海外）；配合 dept_name '
+              '把解析范围限到对应公司',
+      'plan_name': '演练计划名称关键字，可选；去空白子串匹配（如「双路市电中断」），'
+                   '用于在计划列表里定位具体演练',
+      'year': '年份，可选；不传用当前年份（如 2026）',
+      'month': '月份 1-12，可选；「本月/某月演练计划」必传，服务端按 weeks[].month 过滤；'
+               '不确定当前月份先调 get_current_time',
+      'week': '年内周次（字符串或数字，如 "48"），可选；用户说「第 48 周」时传它，'
+              '别在返回结果里翻找',
+      'status': '安排状态，可选；0=已安排（默认，只看该周有演练）/1=未安排（问「哪些周没安排」时传）',
+      'finish_status': '完成状态，可选；1=未开始/2=未完成/3=已完成/4=已逾期',
+      'start_date': '起始日期 YYYY-MM-DD，可选；按周 stime/etime 与该区间重叠判断',
+      'end_date': '结束日期 YYYY-MM-DD，可选；「11 月下旬」这类说法可传区间',
+    },
+    category='drill',
+    domain='drill',
+    kind='资源',
+  ),
+  Capability(
+    id='mgmt.query_drill_week',
+    name='查询演练周明细',
+    description=(
+      '按演练周 id 查询某一周演练的明细。返回**单个对象**：drillPlanId/drillPlanName、'
+      'week（年内周次）、stime/etime（起止日期）、finishStatus（1 未开始 / 2 未完成 / '
+      '3 已完成 / 4 已逾期）、percent（完成百分比），以及 A/B/C/D 四个班组记录文件的'
+      'agroupFileId/agroupFileName … dgroupFileId/dgroupFileName（未上传为空串）。'
+      '适用于「这周演练是哪几天」「四个班组的记录都交了吗」「某周演练的记录文件名」。'
+      '日期读 stime/etime，别按 week 周次推算。只返回文件 id/名称，**不下载、不解析记录内容**。'
+      'week_id 从 query_drill_plans 返回的 weeks[].id 获取。'
+    ),
+    params={
+      'week_id': '演练周 id，必填；从 query_drill_plans 返回的 weeks[].id 获取',
+    },
+    category='drill',
+    domain='drill',
     kind='资源',
   ),
 )

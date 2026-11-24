@@ -90,14 +90,16 @@ def _rows_for(key: str, n: int, window: dict, rng: random.Random) -> list[dict]:
     order_no = f'GD2026{rng.randrange(100000, 999999)}'
     people = {'响应人': rng.choice(OPERATORS), '处理人': rng.choice(OPERATORS)}
     if key == 'response_timeout':
-      lag = rng.uniform(6, 120)
+      limit = int(settings.COMPLIANCE_ALARM_TIMEOUT_MINUTES)
+      lag = rng.uniform(limit + 1, 120)
+      has_order = rng.random() > 0.3   # 三成「没人响应」：工单号/响应时间留空
       responded = (datetime.strptime(alarm_at, '%Y-%m-%d %H:%M:%S')
                    + timedelta(minutes=lag)).strftime('%Y-%m-%d %H:%M:%S')
       rows.append({
-        '序号': i, '工单号': order_no, **base,
-        '告警时间': alarm_at, '响应时间': responded,
-        '响应时长(分钟)': round(lag, 1), **people,
-        '当前告警状态': rng.choice(['触发', '刷新', '恢复']),
+        '序号': i, '工单号': order_no if has_order else '', **base,
+        '告警时间': alarm_at, '响应时间': responded if has_order else '',
+        '超时时间(分钟)': round(lag - limit, 1),
+        '当前告警状态': rng.choice(['触发', '刷新']),
       })
     elif key == 'unclosed_order':
       responded = _at(rng, start, end)

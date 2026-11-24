@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from config.settings import settings
 from models.scheduled_task import RunStatus
-from service.doc_update import fetch, store
+from service.doc_update import fetch, period as period_mod, store
 from service.doc_update.verdict import evaluate, summary_text
 from service.scheduled_task import repository as repo
 
@@ -36,31 +36,59 @@ def _dept_scope() -> bool:
   return (settings.DOC_UPDATE_SCOPE or 'dept').lower() != 'tree'
 
 
+def is_dept_scope() -> bool:
+  """外部入口（API/CLI）判断口径用：补跑历史期只在部门口径下可用。"""
+  return _dept_scope()
+
+
 async def _take_snapshot(previous: dict | None, progress, only=None,
                          dept_names: list[str] | None = None,
-                         companies: list[str] | None = None) -> dict:
+                         companies: list[str] | None = None,
+                         target_period: str | None = None) -> dict:
   if _dept_scope():
     return await fetch.take_dept_snapshot(
       previous=previous, progress=progress, only=only, dept_names=dept_names,
-      companies=companies,
+      companies=companies, target_period=target_period,
     )
+  if target_period:
+    raise ValueError('补跑历史期只支持部门口径（DOC_UPDATE_SCOPE=dept）')
   return await fetch.take_snapshot(previous=previous, progress=progress, only=only)
 
 
 async def perform_sync(created_by: str = '', progress=None, persist: bool = True,
                        dept_names: list[str] | None = None,
-                       companies: list[str] | None = None) -> dict:
+                       companies: list[str] | None = None,
+                       period: str | None = None,
+                       force: bool = False) -> dict:
   """取一期快照 → 落库 → 与**上一期**比对。返回 `{snapshot, verdict}`。
 
   `persist=False` 只算不写（CLI 不加 `--yes` 用）。
   参照只有上一期（`store.previous`）：没有上期就是基线期，**不拿本月早先的检查结果当参照**。
+
+  `dept_names` / `companies` 限定范围时（页面「检查本部门」）**必须并回本期已有快照**：
+  直接落库会把同月其余部门的结论整体抹掉。
+
+  `period`（`YYYY-MM`）：补跑历史期，落库键就是该期；已存在时需 `force=True` 覆盖。
   """
-  key = period_key()
+  target = (period or '').strip()
+  if target and not _dept_scope():
+    raise ValueError('补跑历史期只支持部门口径（DOC_UPDATE_SCOPE=dept）')
+  key = target or period_key()
+  if target:
+    exists = await store.same_period(target) is not None
+    err = period_mod.check_target_period(target, period_key(), exists and not force)
+    if err:
+      raise ValueError(err)
   # last_changed_at 结转优先用本期已有快照（同月重跑不丢上次变更时间），否则用上期
   current = await store.same_period(key)
   carry = current or await store.previous(key)
   snapshot = await _take_snapshot(carry, progress, dept_names=dept_names,
-                                  companies=companies)
+                                  companies=companies,
+                                  target_period=target or None)
+  if dept_names or companies:
+    # 部分部门：并回本期快照（其余部门原样保留）；本期还没有快照时这份就是本期首份
+    if current:
+      snapshot = fetch.merge_snapshot(current, snapshot)
   if persist:
     await store.save(snapshot, created_by=created_by)
   previous = await store.previous(key)
@@ -88,6 +116,8 @@ async def ensure_initial_sync() -> None:
   try:
     await perform_sync(created_by='system', progress=lease.update)
     logger.info('文档更新检查首期基线已自动生成')
+  except sync_state.SyncCancelled:
+    logger.info('文档更新检查首期自动执行已被用户终止（本轮结果未保存）')
   except Exception as e:  # noqa: BLE001  自动跑失败不拦启动
     logger.warning('文档更新检查首期自动执行失败: %s', e)
   finally:
@@ -234,7 +264,8 @@ def _summary(result: dict) -> str:
   ]
   if verdict.get('baseline'):
     if verdict.get('scope') == 'dept':
-      lines.append('- 首轮：按期提交型已直接判定；原地更新型无上期快照，记为基线。')
+      lines.append('- 首轮：有月份期号的查新增项已直接判定；'
+                   '查更新项与无期号的查新增项无上期快照，记为基线。')
     else:
       lines.append('- 首期只建基线，下期起比对是否更新。')
   counts = verdict.get('counts') or {}

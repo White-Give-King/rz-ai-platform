@@ -1,5 +1,5 @@
 import {
-  CheckCircle2, FileMinus, FileQuestionMark, FileX, Flag, type LucideIcon,
+  CheckCircle2, FileMinus, FileQuestionMark, FileSearch, FileX, Flag, type LucideIcon,
 } from 'lucide-react';
 import type { DocUpdateItem, DocUpdateStatus } from '@/api/scheduledTasks';
 
@@ -24,6 +24,12 @@ export const STATUS_VISUALS: Record<DocUpdateStatus, DocStatusVisual> = {
     Icon: FileQuestionMark, chip: 'bg-warning/12 text-warning',
     dot: 'bg-warning', bar: 'bg-warning',
   },
+  // 待复核：模型找到疑似同主题文件但无法确定归属。用蓝色（chart-1）与「未找到」的
+  // warning 橙、下载失败的 destructive 红区分开；chart-3 与 warning 同色，别用
+  review: {
+    Icon: FileSearch, chip: 'bg-chart-1/12 text-chart-1',
+    dot: 'bg-chart-1', bar: 'bg-chart-1',
+  },
   failed: {
     Icon: FileX, chip: 'bg-destructive/10 text-destructive',
     dot: 'bg-destructive', bar: 'bg-destructive',
@@ -34,8 +40,15 @@ export const STATUS_VISUALS: Record<DocUpdateStatus, DocStatusVisual> = {
   },
 };
 
-/** 口径四种状态（基线是「期」的状态，不进计数条）。 */
-export const STATUS_ORDER: DocUpdateStatus[] = ['updated', 'stale', 'missing', 'failed'];
+/** 未知状态（旧前端包遇到新状态）回退为中性灰点，绝不抛异常。 */
+export function statusVisual(status: string): DocStatusVisual {
+  return STATUS_VISUALS[status as DocUpdateStatus] ?? STATUS_VISUALS.stale;
+}
+
+/** 口径状态（基线是「期」的状态，不进计数条）；待复核是「未找到」的细分，紧随其后。 */
+export const STATUS_ORDER: DocUpdateStatus[] = [
+  'updated', 'stale', 'missing', 'review', 'failed',
+];
 
 interface DeptIdent {
   company_id?: string;

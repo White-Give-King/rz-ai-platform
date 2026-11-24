@@ -1,11 +1,11 @@
 """班次窗口 + 四项不合规检查（纯 SQL，确定性）。
 
-口径与三个告警技能逐字对齐（`skills/alarm_unclosed_order` / `alarm_premature_close` /
-`alarm_repeat`）；「告警响应超时」是**已响应但慢**（工单响应时间比告警时间晚 N 分钟以上），
-对齐 `query_alarm_orders(response_timeout_min=N)`，而**不是** skill `alarm_response_timeout`
-（那是「还没有工单 = 没人响应」）。取数自己开 `DcimRepository` 连接、自己写
-SQL —— **不改** `service/dcim_ingest/repository.py` 的既有查询（那是对话工具的取数口径，
-给它加过滤参数会把技能口径搅乱）。
+四项均与对应告警技能逐字对齐（`skills/alarm_response_timeout` / `alarm_unclosed_order` /
+`alarm_premature_close` / `alarm_repeat`）。「告警响应超时」＝**重要及以上告警、本班次发生、
+超过 N 分钟仍未解除、且 N 分钟内没有建处置工单**（含事后补单 —— 工单晚到也说明当时超时了；
+5 分钟内解除的不计）。取数自己开 `DcimRepository` 连接、自己写 SQL —— **不改**
+`service/dcim_ingest/repository.py` 的既有查询（那是对话工具的取数口径，给它加过滤参数
+会把技能口径搅乱）。
 
 时间列（`alarm_time` / `response_time` / `start_time` / `end_time`）都是**秒级 epoch**，
 展示前一律在这里按 Asia/Shanghai 渲染成字符串 —— 表格里不出现裸时间戳。
@@ -37,8 +37,8 @@ CHECKS: tuple[dict, ...] = (
     'name': '告警响应超时',
     'cadence': '班次',
     # 阈值来自配置，写进口径说明时同源 —— 改配置后页面/表头不会说谎
-    'description': (f'重要及以上告警，关联处置工单的响应时间比告警时间晚 '
-                    f'{settings.COMPLIANCE_ALARM_TIMEOUT_MINUTES} 分钟以上'),
+    'description': (f'重要及以上告警，发生超过 {settings.COMPLIANCE_ALARM_TIMEOUT_MINUTES} 分钟'
+                    f'仍未解除、且在 {settings.COMPLIANCE_ALARM_TIMEOUT_MINUTES} 分钟内未建处置工单'),
     'sheet': '告警响应超时',
     'title': '告警响应超时统计',
   },
@@ -74,7 +74,7 @@ CHECKS: tuple[dict, ...] = (
 COLUMNS: dict[str, tuple[str, ...]] = {
   'response_timeout': (
     '序号', '工单号', '园区', '空间', '设备', '测点', '级别', '告警内容',
-    '告警时间', '响应时间', '响应时长(分钟)', '响应人', '处理人', '当前告警状态',
+    '告警时间', '响应时间', '超时时间(分钟)', '当前告警状态',
   ),
   'unclosed_order': (
     '序号', '工单号', '园区', '空间', '设备', '测点', '级别', '告警内容', '告警时间',
@@ -201,33 +201,59 @@ def _query(sql: str, args: list) -> list[dict]:
 
 
 # ==================== 检查一：告警响应超时 ====================
-# **已响应但慢**：有处置工单，且工单的响应时间比告警时间晚 N 分钟以上（重要及以上）。
-# 口径对齐 `query_alarm_orders(response_timeout_min=N)`（repository.py 的 `_RESP_` 条件），
-# **不是** skill `alarm_response_timeout`（那是「还没有工单 = 没人响应」，另一回事）。
-# 按 `response_time` 归属班次：跨零点的单跟着响应时刻走，不会算错班。
+# **重要及以上告警、本班次发生、超 N 分钟仍未解除、且 N 分钟内没建处置工单**。
+# 口径对齐 skill `alarm_response_timeout`（有单 = 已响应；没单 = 没人响应），但**含事后补单**：
+# 工单晚到也说明当时超时了，只是展示时能给出实际响应时间。5 分钟内解除的不计（status='3'）。
+# 按 `alarm_time` 归属班次：告警发生在哪个班次就记哪个班次。
 _RESPONSE_TIMEOUT_SQL = (
-  'SELECT o.cluster, o.guid AS order_no,'
-  '       COALESCE(s.name, o.space_name) AS space_name,'
-  '       o.device_name, o.point_name,'
-  '       COALESCE(o.alarm_level, a.alarm_level) AS alarm_level, o.content,'
-  '       o.alarm_time, o.response_time, o.responder, o.handler,'
-  '       a.status AS alarm_status'
-  '  FROM dcim_alarm_orders o'
-  '  LEFT JOIN dcim_alarms a ON a.cluster = o.cluster AND a.guid = o.event_log_id'
-  '  LEFT JOIN dcim_spaces s ON s.cluster = o.cluster AND s.guid = o.space_guid'
-  ' WHERE NOT o.is_deleted'
-  '   AND o.alarm_level >= 3'
-  '   AND o.alarm_time > 0 AND o.response_time > o.alarm_time'
-  '   AND (o.response_time - o.alarm_time) > %s'
-  '   AND o.response_time >= %s AND o.response_time < %s'
-  ' ORDER BY o.cluster, o.response_time'
+  'SELECT a.cluster,'
+  "       COALESCE(s.name, '') AS space_name,"
+  '       a.device_name, a.point_name, a.alarm_level, a.content,'
+  '       a.alarm_time, a.status AS alarm_status,'
+  '       o.guid AS order_no, o.response_time'
+  '  FROM dcim_alarms a'
+  '  LEFT JOIN dcim_spaces s ON s.cluster = a.cluster AND s.guid = a.space_guid'
+  '  LEFT JOIN LATERAL ('
+  '    SELECT o2.guid, o2.response_time'
+  '      FROM dcim_alarm_orders o2'
+  '     WHERE o2.cluster = a.cluster AND o2.event_log_id = a.guid'
+  '       AND NOT o2.is_deleted AND o2.response_time > 0'
+  '     ORDER BY o2.response_time'
+  '     LIMIT 1) o ON TRUE'
+  ' WHERE NOT a.is_deleted'
+  '   AND a.alarm_level >= 3'
+  # 仍未解除（刷新态 2 也算在跑）；alarm_time <= now-N 分钟
+  "   AND a.status <> '3'"
+  '   AND a.alarm_time > 0'
+  '   AND a.alarm_time <= %s'
+  '   AND a.alarm_time >= %s AND a.alarm_time < %s'
+  '   AND NOT EXISTS ('
+  '     SELECT 1 FROM dcim_alarm_orders o3'
+  '      WHERE o3.cluster = a.cluster AND o3.event_log_id = a.guid'
+  '        AND NOT o3.is_deleted'
+  '        AND o3.response_time > a.alarm_time'
+  # N 分钟内已响应 → 不算超时
+  '        AND o3.response_time <= a.alarm_time + %s)'
+  ' ORDER BY a.cluster, a.alarm_time'
 )
 
 
+def _overtime(alarm_s, end_s, limit_s: int, digits: int = 1):
+  """超出阈值的分钟数（end 已是「响应时刻或当前时刻」）；任一无效 → 空串。"""
+  try:
+    a, b = int(alarm_s), int(end_s)
+  except (TypeError, ValueError):
+    return ''
+  if a <= 0 or b <= 0:
+    return ''
+  return round(max(0.0, (b - a - limit_s) / 60), digits)
+
+
 def response_timeout(start_s: int, end_s: int, now_s: int | None = None) -> list[dict]:
-  """`now_s` 保留只为 `_RUNNERS` 三个参数统一签名 —— 新口径不依赖「当前时刻」。"""
+  """`now_s` 参与判定：「发生已超 N 分钟」与无响应时的超时时长都以它为准。"""
   limit_s = int(settings.COMPLIANCE_ALARM_TIMEOUT_MINUTES) * 60
-  rows = _query(_RESPONSE_TIMEOUT_SQL, [limit_s, start_s, end_s])
+  now_s = int(now_s or time.time())
+  rows = _query(_RESPONSE_TIMEOUT_SQL, [now_s - limit_s, start_s, end_s, limit_s])
   return [
     {
       '序号': i,
@@ -240,9 +266,8 @@ def response_timeout(start_s: int, end_s: int, now_s: int | None = None) -> list
       '告警内容': _text(r.get('content')),
       '告警时间': fmt_ts(r.get('alarm_time')),
       '响应时间': fmt_ts(r.get('response_time')),
-      '响应时长(分钟)': _minutes(r.get('alarm_time'), r.get('response_time')),
-      '响应人': _text(r.get('responder')),
-      '处理人': _text(r.get('handler')),
+      '超时时间(分钟)': _overtime(r.get('alarm_time'),
+                                 r.get('response_time') or now_s, limit_s),
       '当前告警状态': _ALARM_STATUS_LABELS.get(_text(r.get('alarm_status')), ''),
     }
     for i, r in enumerate(rows, 1)

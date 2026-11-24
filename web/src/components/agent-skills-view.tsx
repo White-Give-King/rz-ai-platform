@@ -4,6 +4,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
+import { useConfirm } from '@/components/confirm-dialog';
 import {
   deleteSkill,
   listSkills,
@@ -15,8 +16,8 @@ type Tab = 'all' | 'official' | 'mine';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'all', label: '全部' },
-  { key: 'official', label: '公共' },
-  { key: 'mine', label: '自定义' },
+  { key: 'official', label: '公共技能' },
+  { key: 'mine', label: '自定义技能' },
 ];
 
 /** 图标块按技能名 hash 取色 —— 只是视觉区分，不承载语义。 */
@@ -120,7 +121,16 @@ function SkillCard({
   );
 }
 
-export function AgentSkillsView({ query, searchSlot }: { query: string; searchSlot?: ReactNode }) {
+export function AgentSkillsView({
+  query,
+  searchSlot,
+  leadingSlot,
+}: {
+  query: string;
+  searchSlot?: ReactNode;
+  leadingSlot?: ReactNode;
+}) {
+  const confirm = useConfirm();
   const [skills, setSkills] = useState<AgentSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -180,9 +190,17 @@ export function AgentSkillsView({ query, searchSlot }: { query: string; searchSl
   };
 
   const handleDelete = async (skill: AgentSkill) => {
-    const ok = window.confirm(
-      `确定删除技能「${skill.title}」吗？删除后不可恢复。\n如需再次使用，可在对话里让智能体重建。`,
-    );
+    const ok = await confirm({
+      title: `删除技能「${skill.title}」？`,
+      description: (
+        <>
+          <p>删除后不可恢复。</p>
+          <p>如需再次使用，可在对话里让智能体重建。</p>
+        </>
+      ),
+      confirmText: '删除',
+      variant: 'destructive',
+    });
     if (!ok) return;
     try {
       await deleteSkill(skill.name);
@@ -196,6 +214,7 @@ export function AgentSkillsView({ query, searchSlot }: { query: string; searchSl
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card p-2 shadow-sm">
+        {leadingSlot}
         {TABS.map((t) => (
           <button
             key={t.key}

@@ -66,6 +66,9 @@ class AgentService:
     self._model = None
     self._catalog_hash = None
     self._mode_gated_names: tuple[str, ...] = ()
+    # deferred catalog 里的工具名（含内置扩展桶），供编排层预 promote 时过滤不存在的工具
+    self._deferred_names: frozenset[str] = frozenset()
+    self._has_deferred_builtins = False
     self._checkpointer = None
     self._checkpointer_closer = None
     self._fingerprint = None
@@ -181,14 +184,21 @@ class AgentService:
       scheduled_tools = [wrap_async_tool_with_error_handling(schedule_task)]
 
     # 事件统计表（async，走 raw_tools）：飞书园区群通报 → 告警/工单关联，确定性出 xlsx。
-    # 另含 `incident_progress`（单个事件的完整进展时间线）。
+    # 另含 `incident_progress`（单个事件的完整进展时间线）与 `group_message_search`
+    # （检索已入库的群消息原文，含 kind='other' 的普通消息）。
     # **不依赖 INCIDENT_STATS_ENABLED** —— 那个开关只管定时预设与后台轮询，
     # 对话里手动出一张表随时可用。
-    from tools.incident_tools import incident_progress, incident_report
+    from tools.incident_tools import group_message_search, incident_progress, incident_report
     incident_tools = [
       wrap_async_tool_with_error_handling(incident_report),
       wrap_async_tool_with_error_handling(incident_progress),
+      wrap_async_tool_with_error_handling(group_message_search),
     ]
+
+    # 每日变更统计（async，走 raw_tools）：日常运维群人发变更通知 → 园区×数据中心明细。
+    # **不依赖 CHANGE_NOTICE_ENABLED** —— 那个开关只管每日定时预设，对话里随时可查。
+    from tools.change_notice_tools import change_notice_report
+    change_notice_tools = [wrap_async_tool_with_error_handling(change_notice_report)]
 
     # 事件单 ↔ DCIM 告警判定表（async，走 raw_tools）：先查判定表，缺的才补判。
     # 仅 DCIM_ENABLED 时注入——判定本身依赖 DCIM 告警数据；MGMT 关闭时仍可查表
@@ -204,6 +214,13 @@ class AgentService:
     if settings.DOC_UPDATE_CHECK_ENABLED:
       from tools.doc_update_tools import doc_update_check
       doc_update_tools = [wrap_async_tool_with_error_handling(doc_update_check)]
+
+    # 应急演练合规审查（async，走 raw_tools）：演练周 4 份班组 PDF → OCR → 检索 EOP →
+    # LLM 比对 → 结构化结论。仅 DRILL_AUDIT_ENABLED 时注入。
+    drill_audit_tools = []
+    if settings.DRILL_AUDIT_ENABLED:
+      from tools.drill_audit_tools import drill_compliance_audit
+      drill_audit_tools = [wrap_async_tool_with_error_handling(drill_compliance_audit)]
 
     # 历史归档回读（async，走 raw_tools）：压缩会把旧消息整条删掉只留摘要，摘要是有损的
     # （实体名/编号可能被改写）。这两个工具让模型按需回读被压缩掉消息的原文。
@@ -241,6 +258,16 @@ class AgentService:
         wrap_async_tool_with_error_handling(list_group_members),
       ]
 
+    # 内置「扩展桶」：与平台工具走**同一套** deferred 机制（catalog + tool_search +
+    # promotion），不再每轮常驻完整 schema。它们仍是真 BaseTool，只是没有 capability
+    # 身份——tool_search 靠 extra_entries 语义检索它们（见 build_deferred_setup）。
+    # 常驻底座（base/analysis/upload/history/write_todos）刻意不进这里。
+    builtin_deferrable = [
+      *incident_tools, *change_notice_tools, *event_alarm_tools, *agent_video_tools,
+      *feishu_tools, *drill_audit_tools, *doc_update_tools, *scheduled_tools,
+      skill_manage_tool, stage_skill_script_tool,
+    ]
+
     # 平台 deferred 工具：任一 <PLATFORM>_ENABLED 开关开启时，把已注册平台的能力
     # 生成为真工具（带 schema 强校验），交给 deferred filter 隐藏 schema，LLM 经
     # tool_search（语义检索）按需加载。
@@ -267,8 +294,10 @@ class AgentService:
       from service.query.base.tools_factory import build_all_tools, tool_name_to_capability
       from core.agent.deferred import build_deferred_setup, deferred_tools_prompt
       from service.query.base.manifest import (
-        build_category_manifest, public_skill_tool_names, skill_usage_hint,
+        build_category_manifest, build_deferred_builtin_hint,
+        public_skill_tool_names, skill_usage_hint,
       )
+      from service.query.tool_catalog import TOOL_TITLES
 
       platform_tools = build_all_tools()
       # 父技能工具（skill__chart 等，params 为空、schema 极小）**不进 deferred**：技能正文靠
@@ -293,28 +322,43 @@ class AgentService:
       # 被 promote 了也没有对应工具可露，实测表现为「日志说放开了、模型却看不到工具」）。
       # 它们不进 catalog（tool_search 搜不到），只进 filter 的隐藏集合，等预 promote 放开。
       gated_tools = [t for t in platform_tools if t.name in gated_names]
-      deferred_tools, deferred_mw, _deferred_names, catalog_hash = build_deferred_setup(
-        [t for t in platform_tools if t.name not in stay_visible and t.name not in gated_names],
+      extra_entries = {
+        t.name: f'{TOOL_TITLES.get(t.name, t.name)}。{(t.description or "")[:300]}'
+        for t in builtin_deferrable
+      }
+      deferred_tools, deferred_mw, deferred_names, catalog_hash = build_deferred_setup(
+        [t for t in platform_tools if t.name not in stay_visible and t.name not in gated_names]
+        + builtin_deferrable,
         top_k=settings.DCIM_RETRIEVAL_TOP_K,
         extra_hidden=gated_names,
+        extra_entries=extra_entries,
       )
-      # deferred 工具 + tool_search 是 async / 返回 Command，走 raw 通道不包装
+      # deferred 工具 + tool_search 是 async / 返回 Command，走 raw 通道不包装。
+      # 内置扩展桶已并入 catalog（deferred_tools），raw_tools 里不能再列一遍（同名冲突）。
       raw_tools = (deferred_tools + visible_tools + gated_tools + analysis_tools
-                   + [skill_manage_tool, stage_skill_script_tool, write_todos] + upload_tools + scheduled_tools
-                   + feishu_tools + history_tools + agent_video_tools + incident_tools
-                   + event_alarm_tools + doc_update_tools)
+                   + [write_todos] + upload_tools + history_tools)
       middleware.append(deferred_mw)
       # P-2：<available-tools> 从全量工具名改为分类清单（build_category_manifest），
       # 每轮省 ~2.7k token；deferred_names 不再进 prompt。技能另有 <skills> 提示段：
       # 技能正文不进上下文，但必须让模型知道"有技能、该去调"（对齐 DeerFlow 的 skill_index）。
-      extra_prompt = deferred_tools_prompt(build_category_manifest()) + skill_usage_hint()
+      # 扩展段让模型知道内置扩展桶也在 tool_search 目录里。
+      extra_prompt = (
+        deferred_tools_prompt(build_category_manifest())
+        + build_deferred_builtin_hint(deferred_names)
+        + skill_usage_hint()
+      )
       self._catalog_hash = catalog_hash
+      self._deferred_names = deferred_names
+      self._has_deferred_builtins = bool(builtin_deferrable)
     else:
       raw_tools = (list(analysis_tools) + [skill_manage_tool, stage_skill_script_tool, write_todos] + upload_tools
                    + scheduled_tools + feishu_tools + history_tools + agent_video_tools
-                   + incident_tools + event_alarm_tools + doc_update_tools)
+                   + incident_tools + change_notice_tools + event_alarm_tools + doc_update_tools
+                   + drill_audit_tools)
       self._catalog_hash = None
       self._mode_gated_names = ()
+      self._deferred_names = frozenset()
+      self._has_deferred_builtins = False
 
     # 权限不触发重建：RBAC 走 stream() 里 set_current_permissions 设置的运行时
     # contextvar 检查，见 build.py 说明。
@@ -383,13 +427,17 @@ class AgentService:
     # 填 intent_labels，词汇表非空时会自动恢复走 Step1+2 快路径。
     initial_state = {}
     from service.query.base.intent_bindings import all_intent_labels
-    # 联网调研模式/联网开关即便意图标签为空也要走编排：唯一的目的是把模式门控的联网工具放出来
-    if self._catalog_hash and (all_intent_labels() or self._mode_gated_names):
+    # 联网调研模式/联网开关即便意图标签为空也要走编排：唯一的目的是把模式门控的联网工具放出来。
+    # 内置扩展桶进场后，词汇表为空时正则路由（match_builtin_tools）也要生效 → 同样不能跳过。
+    if self._catalog_hash and (
+      all_intent_labels() or self._mode_gated_names or self._has_deferred_builtins
+    ):
       from core.agent.orchestrator import build_initial_state
       recent = await _collect_recent_context(session_id)
       initial_state = await build_initial_state(
         message, self._catalog_hash, history=recent, task_mode=task_mode,
         web_search=web_search, gated_names=self._mode_gated_names,
+        known_names=self._deferred_names,
       )
 
     from core.agent.prompts import MODE_INSTRUCTIONS, PLAN_MODE_INSTRUCTION

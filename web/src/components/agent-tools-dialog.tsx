@@ -2,7 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Loader2, Search, Wrench, X } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
-import { listTools, type ToolGroup, type ToolItem, type ToolVisibility } from '@/api/tools';
+import {
+  getCachedTools,
+  listTools,
+  type ToolGroup,
+  type ToolItem,
+  type ToolVisibility,
+} from '@/api/tools';
 
 const VISIBILITY: Record<ToolVisibility, { label: string; dot: string }> = {
   always: { label: '常驻可用', dot: 'bg-emerald-500' },
@@ -57,6 +63,13 @@ export function AgentToolsDialog({ open, onClose }: { open: boolean; onClose: ()
   const [query, setQuery] = useState('');
 
   const load = useCallback(async () => {
+    const cached = getCachedTools();
+    if (cached) {
+      setGroups(cached);
+      setLoaded(true);
+      setError('');
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -109,10 +122,20 @@ export function AgentToolsDialog({ open, onClose }: { open: boolean; onClose: ()
           'rounded-xl border border-border bg-card shadow-lg',
         )}
       >
+        <button
+          onClick={onClose}
+          className={cn(
+            'absolute top-4 right-4 z-10 rounded-md p-1',
+            'text-muted-foreground hover:bg-accent',
+          )}
+          aria-label="关闭工具目录"
+        >
+          <X className="size-4" />
+        </button>
         <header
           className={cn(
             'flex shrink-0 flex-wrap items-end justify-between gap-3',
-            'border-b border-border px-5 py-4',
+            'border-b border-border px-5 py-4 pr-12',
           )}
         >
           <div className="min-w-0">
@@ -136,13 +159,6 @@ export function AgentToolsDialog({ open, onClose }: { open: boolean; onClose: ()
                 className="h-9 rounded-xl bg-muted/30 pl-9 shadow-none"
               />
             </div>
-            <button
-              onClick={onClose}
-              className="rounded-md p-1 text-muted-foreground hover:bg-accent"
-              aria-label="关闭工具目录"
-            >
-              <X className="size-4" />
-            </button>
           </div>
         </header>
 

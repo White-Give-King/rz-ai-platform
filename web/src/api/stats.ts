@@ -17,6 +17,9 @@ export interface OverviewData {
   risk_check_change: number | null;
   fire_safety_count: number;
   fire_safety_change: number | null;
+  /** 本周生成成功的统计分析报告份数（预设报告 run） */
+  report_count: number;
+  report_change: number | null;
   doc_count: number;
 }
 
@@ -42,6 +45,8 @@ const OVERVIEW_DEFAULTS: OverviewData = {
   risk_check_change: null,
   fire_safety_count: 0,
   fire_safety_change: null,
+  report_count: 0,
+  report_change: null,
   doc_count: 0,
 };
 

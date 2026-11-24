@@ -8,6 +8,7 @@ import { PlatformShell } from '@/components/platform-shell';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { useConfirm } from '@/components/confirm-dialog';
 import { uploadFile, deleteFile, getVectorStoreInfo, getGroups, createGroup as createGroupApi, deleteGroupApi, getStats } from '@/api/rag';
 import { useAuthStore } from '@/stores/authStore';
 
@@ -64,6 +65,7 @@ function fmtTime(ts: string) {
 }
 
 export default function KnowledgePage() {
+  const confirm = useConfirm();
   const [uploading, setUploading] = useState<{ current: number; total: number } | null>(null);
   const [docs, setDocs] = useState<DocItem[]>([]);
   const [search, setSearch] = useState('');
@@ -193,7 +195,13 @@ export default function KnowledgePage() {
   };
 
   const handleDelete = async (name: string) => {
-    if (!window.confirm(`确认删除「${name}」？删除后不可恢复。`)) return;
+    const ok = await confirm({
+      title: `删除「${name}」？`,
+      description: '删除后不可恢复。',
+      confirmText: '删除',
+      variant: 'destructive',
+    });
+    if (!ok) return;
     try {
       const res = await deleteFile(name, activeGroup);
       if (res.ok) {
@@ -228,7 +236,13 @@ export default function KnowledgePage() {
 
   const handleBatchDelete = async () => {
     if (selected.size === 0) return;
-    if (!window.confirm(`确认删除选中的 ${selected.size} 个文档？删除后不可恢复。`)) return;
+    const ok = await confirm({
+      title: `删除选中的 ${selected.size} 个文档？`,
+      description: '删除后不可恢复。',
+      confirmText: '删除',
+      variant: 'destructive',
+    });
+    if (!ok) return;
     const names = Array.from(selected);
     let success = 0;
     let fail = 0;
@@ -281,7 +295,13 @@ export default function KnowledgePage() {
       return;
     }
     const groupName = groups.find((g) => g.group_id === groupId)?.name || groupId;
-    if (!window.confirm(`确认删除知识库「${groupName}」？知识库内所有文档将被一并删除。`)) return;
+    const ok = await confirm({
+      title: `删除知识库「${groupName}」？`,
+      description: '知识库内所有文档将被一并删除。',
+      confirmText: '删除',
+      variant: 'destructive',
+    });
+    if (!ok) return;
     try {
       const res = await deleteGroupApi(groupId);
       if (res.ok) {

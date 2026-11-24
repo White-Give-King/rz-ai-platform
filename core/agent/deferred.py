@@ -156,7 +156,11 @@ class DeferredToolFilterMiddleware(AgentMiddleware):
     return blocked if blocked is not None else await handler(request)
 
 
-def build_tool_search(catalog: DeferredCatalog, top_k: int = 8) -> BaseTool:
+def build_tool_search(
+  catalog: DeferredCatalog,
+  top_k: int = 8,
+  extra_entries: dict[str, str] | None = None,
+) -> BaseTool:
   """构建 tool_search 工具：embedding 语义检索 + 返回发现卡片 + promote。
 
   与 DeerFlow 的差异：检索复用 service/query/base/retriever.py 的语义检索
@@ -164,6 +168,13 @@ def build_tool_search(catalog: DeferredCatalog, top_k: int = 8) -> BaseTool:
   （P-3：不再返回完整 OpenAI schema——被 promote 的工具下一轮 model request 里
   LangGraph 会自动带上它的完整 schema，这里只需告诉 LLM 发现了什么、可选哪个，
   避免一次塞 3000-6000 token 进上下文），并把工具名写入 state['promoted']。
+
+  Args:
+    catalog: 能力侧目录（capability → 工具名解析走它）。
+    top_k: 每次最多 promote 几个。
+    extra_entries: 内置工具的检索文本 `{工具名: 标题+描述}`。非空时，检索同时覆盖
+      能力与这批内置工具，两路按余弦分合并取 top_k；它们同样是 catalog 里的真
+      BaseTool，只是没有 capability 身份，命中后直接按工具名 `catalog.by_name`。
   """
   catalog_hash = catalog.hash
 
@@ -173,36 +184,56 @@ def build_tool_search(catalog: DeferredCatalog, top_k: int = 8) -> BaseTool:
 
     系统提示的 <available-tools> 里列出各平台的分类清单。调用本工具按语义检索
     匹配的工具，返回其名称/简述/参数名；返回后这些工具即可调用（参数详说明在
-    下一轮模型请求里会随工具 schema 一起提供）。
+    下一轮模型请求里会随工具 schema 一起提供）。除平台数据能力外，也可检索扩展
+    工具：讲解视频 / 飞书消息 / 事件与变更统计 / 演练审查 / 文档更新检查 / 定时任务 /
+    技能管理。
 
     Args:
       query: 查询意图，如 'A7机房有哪些告警'、'机房容量还剩多少'
     """
     from core.agent.user_context import get_current_user_id
     from service.query.base.platform import get_capability
-    from service.query.base.retriever import search_capabilities
+    from service.query.base.retriever import search_capabilities_scored, search_entries_scored
     from service.query.base.tools_factory import capability_to_tool_name
 
-    cap_ids = await search_capabilities(query, k=top_k)
     current_user = get_current_user_id()
     # 本人已停用的自建技能不 promote、不进发现卡片（开关是运行时偏好，不动共享图）
     disabled: set[str] = set()
     if current_user:
       from service.query.skills.states import get_disabled_skill_names
       disabled = await get_disabled_skill_names(current_user)
-    # capability_id → 工具名 → catalog 里的真工具
-    matched = []
-    for cid in cap_ids:
-      cap = get_capability(cid)
+
+    # 两路检索：能力（capability id）与内置工具（直接工具名），按分数合并
+    hits: list[tuple[float, str, str]] = []  # (score, kind, key)
+    for cid, score in await search_capabilities_scored(query, k=top_k):
+      hits.append((score, 'cap', cid))
+    if extra_entries:
+      for key, score in await search_entries_scored(query, extra_entries, k=top_k):
+        hits.append((score, 'entry', key))
+    hits.sort(key=lambda x: x[0], reverse=True)
+
+    matched: list[BaseTool] = []
+    seen: set[str] = set()
+    for _, kind, key in hits:
+      if len(matched) >= top_k:
+        break
+      if kind == 'entry':
+        t = catalog.by_name(key)
+        if t is not None and t.name not in seen:
+          matched.append(t)
+          seen.add(t.name)
+        continue
+      cap = get_capability(key)
       # 用户自建技能只对本人生效：非本人技能在检索结果里过滤掉（不 promote、不进
       # ToolMessage），实现运行期按用户隔离
       if cap is not None and cap.owner and cap.owner != current_user:
         continue
       if cap is not None and cap.owner and cap.id.split('.')[1] in disabled:
         continue
-      t = catalog.by_name(capability_to_tool_name(cid))
-      if t is not None:
+      t = catalog.by_name(capability_to_tool_name(key))
+      if t is not None and t.name not in seen:
         matched.append(t)
+        seen.add(t.name)
 
     if not matched:
       content, names = f'未找到匹配 "{query}" 的工具', []
@@ -226,7 +257,10 @@ def build_tool_search(catalog: DeferredCatalog, top_k: int = 8) -> BaseTool:
 
 
 def build_deferred_setup(
-  deferred_tools: list[BaseTool], top_k: int = 8, extra_hidden: tuple[str, ...] = (),
+  deferred_tools: list[BaseTool],
+  top_k: int = 8,
+  extra_hidden: tuple[str, ...] = (),
+  extra_entries: dict[str, str] | None = None,
 ):
   """从 deferred 工具集组装：catalog + tool_search + filter middleware。
 
@@ -236,6 +270,8 @@ def build_deferred_setup(
     extra_hidden: **不进检索目录、但默认也要隐藏 schema** 的工具名。用于模式门控的
       工具（如联网调研模式的 web 工具）：tool_search 搜不到（模型无法自己 promote），
       只有编排层在该模式下预 promote 才可见；硬调也会被 filter 拦成错误消息。
+    extra_entries: 内置工具的检索文本 `{工具名: 标题+描述}`，让 tool_search 的语义
+      检索也覆盖这批「非 capability 身份」的工具。为空时行为与不带该参数逐字一致。
 
   Returns:
     (all_tools, middleware, deferred_names, catalog_hash)
@@ -245,7 +281,7 @@ def build_deferred_setup(
     - catalog_hash：catalog 指纹，供编排层预 promote 时按此隔离
   """
   catalog = DeferredCatalog(tuple(deferred_tools))
-  search_tool = build_tool_search(catalog, top_k=top_k)
+  search_tool = build_tool_search(catalog, top_k=top_k, extra_entries=extra_entries)
   mw = DeferredToolFilterMiddleware(frozenset(catalog.names) | set(extra_hidden), catalog.hash)
   all_tools = list(deferred_tools) + [search_tool]
   return all_tools, mw, catalog.names, catalog.hash

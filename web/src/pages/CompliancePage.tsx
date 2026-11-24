@@ -1,12 +1,15 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
-  ArrowLeft, ArrowUpRight, BarChart3, CheckCircle2, ClipboardList, Clock,
+  CheckCircle2, ClipboardList, Clock,
   Download, FileSpreadsheet, Loader2, LockKeyhole, Moon, RefreshCw, Repeat2,
   ShieldCheck, Sun, Timer, XCircle, type LucideIcon,
 } from 'lucide-react';
 import type { DateRange } from 'react-day-picker';
 import { PlatformShell } from '@/components/platform-shell';
+import { BoardHeader, type Crumb } from '@/components/board-header';
+import { ComplianceMetric, ComplianceTile } from '@/components/compliance-tile';
 import { DocUpdatePanel } from '@/components/doc-update-panel';
+import { DrillAuditPanel } from '@/components/drill-audit-panel';
 import { InfraredQualityPanel } from '@/components/infrared-quality-panel';
 import { RecordsTable } from '@/components/RecordsTable';
 import { FullScreenOverlay } from '@/components/full-screen-overlay';
@@ -17,12 +20,10 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import {
-  complianceSheetUrl, fetchComplianceArtifactBlob, fetchIncidentArtifactBlob,
-  getComplianceRunSheets, getComplianceSpec, getIncidentPeriodSheets, incidentPeriodSheetUrl,
-  listComplianceRuns, listIncidentPeriods,
+  complianceSheetUrl, fetchComplianceArtifactBlob, getComplianceRunSheets, getComplianceSpec,
+  listComplianceRuns,
   type ComplianceCheck, type ComplianceRun, type ComplianceRunSheets,
   type ComplianceSpec, type ComplianceSummaryItem,
-  type IncidentParkRun, type IncidentPeriod, type IncidentPeriodSheets,
 } from '@/api/scheduledTasks';
 
 const RUN_LABEL: Record<string, string> = {
@@ -71,11 +72,7 @@ function fmtShort(iso: string | null | undefined): string {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** 期号 `2026-10-27-n` / `-d` → 班次类型、日期、窗口（从 period_label 的括号里取）。
- *
- * 不合规检查的 run 与事件统计表的期（`IncidentPeriod`）都只用到这三个字段，
- * 所以吃 duck type：两处必须用**同一套**判定，否则大卡与期卡会说两个班次。
- */
+/** 期号 `2026-10-27-n` / `-d` → 班次类型、日期、窗口（从 period_label 的括号里取）。 */
 type ShiftLike = { period_key: string; period_label: string; triggered_at?: string };
 
 function shiftMeta(run: ShiftLike) {
@@ -124,250 +121,59 @@ function StatusBadge({ run }: { run: ComplianceRun }) {
   return <Badge variant="success"><CheckCircle2 className="size-3" />已完成</Badge>;
 }
 
-/** 四项命中的迷你条（卡片内）。计数缺失（失败/老记录）时不画。 */
-function MiniBars({
-  check, counts, max,
-}: {
-  check: ComplianceCheck;
-  counts: Record<string, number> | undefined;
-  max: number;
-}) {
-  const value = counts?.[check.key];
-  const { Icon, bar } = visualOf(check.key);
-  const pct = value ? Math.max(6, (value / max) * 100) : 0;
-  return (
-    <div className="flex items-center gap-2 text-xs">
-      <Icon className="size-3.5 shrink-0 text-muted-foreground" />
-      <span className="w-24 shrink-0 truncate text-muted-foreground">{check.name}</span>
-      <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
-        <span className={cn('block h-full rounded-full transition-all', bar)} style={{ width: `${pct}%` }} />
-      </span>
-      <span className={cn(
-        'w-6 shrink-0 text-right tabular-nums',
-        value ? 'text-foreground' : 'text-muted-foreground/60',
-      )}>{value ?? '—'}</span>
-    </div>
-  );
-}
-
-/** 一期卡片。点击进看板；右下角单独下载。 */
-function ShiftCard({
-  run, checks, onOpen,
-}: {
-  run: ComplianceRun;
-  checks: ComplianceCheck[];
-  onOpen: (run: ComplianceRun) => void;
-}) {
-  const meta = shiftMeta(run);
-  const counts = run.check_counts;
-  const total = totalOf(run);
-  const usable = total !== null;
-  const max = counts ? Math.max(1, ...checks.map((c) => counts[c.key] ?? 0)) : 1;
-  const clean = run.status === 'success' && total === 0;
-  const ShiftIcon = meta.kind === 'night' ? Moon : Sun;
-
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={() => onOpen(run)}
-      onKeyDown={(e) => { if (e.key === 'Enter') onOpen(run); }}
-      title={run.status === 'failed' ? (run.error || '生成失败') : `${run.period_label}｜${run.teaser}`}
-      className={cn(
-        'group flex cursor-pointer flex-col gap-2.5 rounded-xl border bg-card p-3.5 text-left shadow-sm transition-all hover:shadow-md',
-        clean ? 'border-l-2 border-l-success' : 'border-border',
-        'hover:border-primary/40',
-        !hasArtifact(run) && !clean && 'border-dashed',
-      )}
-    >
-      <div className="flex items-center gap-2">
-        <span className={cn(
-          'flex size-7 shrink-0 items-center justify-center rounded-lg',
-          meta.kind === 'night' ? 'bg-primary/10 text-primary' : 'bg-warning/15 text-warning',
-        )}>
-          <ShiftIcon className="size-3.5" />
-        </span>
-        <span className="text-sm font-semibold">{meta.label}</span>
-        <span className="text-xs tabular-nums text-muted-foreground">{meta.day}</span>
-        <span className="ml-auto"><StatusBadge run={run} /></span>
-      </div>
-
-      {meta.window && (
-        <p className="text-[11px] tabular-nums text-muted-foreground/80">{meta.window}</p>
-      )}
-
-      <div className="flex items-baseline gap-1.5">
-        <span className={cn(
-          'text-2xl font-semibold tracking-tight tabular-nums',
-          clean ? 'text-success' : usable ? 'text-foreground' : 'text-muted-foreground/60',
-        )}>{usable ? total : '—'}</span>
-        <span className="text-xs text-muted-foreground">
-          {usable ? (total === 0 ? '本班次未发现不合规项' : '条不合规') : '无命中数据'}
-        </span>
-      </div>
-
-      {usable && checks.length > 0 && (
-        <div className="space-y-1.5">
-          {checks.map((c) => (
-            <MiniBars key={c.key} check={c} counts={counts} max={max} />
-          ))}
-        </div>
-      )}
-
-      {!usable && run.error && (
-        <p className="line-clamp-2 text-xs text-destructive/80">{run.error}</p>
-      )}
-
-      <div className="mt-auto flex items-center gap-2 border-t border-border pt-2 text-[11px] text-muted-foreground">
-        <span className="tabular-nums">{fmtShort(run.triggered_at)}</span>
-        {run.duration_ms > 0 && <span className="tabular-nums">· {(run.duration_ms / 1000).toFixed(0)}s</span>}
-        <span className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-          看板 <ArrowUpRight className="size-3.5" />
-        </span>
-        <Button
-          size="xs"
-          variant="ghost"
-          className="-mr-1"
-          disabled={!hasArtifact(run)}
-          onClick={(e) => { e.stopPropagation(); void saveWorkbook(run); }}
-          title="下载 Excel"
-        >
-          <Download className="size-3.5" />
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-/** 事件统计表 xlsx：端点要 Bearer 头，先 fetch 成 Blob 再触发下载。 */
-async function saveIncidentFiles(items: IncidentParkRun[]): Promise<void> {
-  for (const item of items) {
-    // 现在一期一份合并表（park === 'all'），历史期才是「一园区一份」才带园区名
-    const suffix = item.park === 'all' ? '' : `_${item.park_label}`;
-    for (const name of item.files) {
-      const blob = await fetchIncidentArtifactBlob(item.run_id, name);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `数据中心事件统计表${suffix}${name.slice(name.lastIndexOf('.'))}`;
-      a.click();
-      URL.revokeObjectURL(url);
-      // 浏览器对连续下载有节流：多园区「下载全部」时留出间隔，否则后面的会被吞掉
-      await new Promise((resolve) => setTimeout(resolve, 300));
-    }
-  }
-}
-
 /**
- * 顶部大卡：数据中心事件统计表（飞书园区群通报）最近一期。
- *
- * 它不是「不合规检查」的产出，而是同一值守视角的另一张表（全部园区 × 班次）。放在这里是
- * 因为值守每班先看这两张：事件统计表看「这一班通报了什么」，不合规检查看「班次里有哪些
- * 处置口径没做到」。没有产出时也保留这张卡，用说明文案代替数字（否则页面顶部会空一块）。
+ * 告警不合规检查汇总卡：只显示最近一期，点开整屏看板按期浏览。
+ * 没有产出时保留这张卡（虚线 + 说明），否则「不合规检查」入口会从页面上消失。
+ * 与其它三张卡同形态：一句摘要 + 元信息，无按钮、无计数 chip，操作都在看板里。
  */
-function IncidentHero({
-  period, onOpen,
+function CompliancePanel({
+  latest, loading, checks, onOpen,
 }: {
-  period: IncidentPeriod | null;
-  onOpen: (period: IncidentPeriod) => void;
+  latest: ComplianceRun | null;
+  loading: boolean;
+  checks: ComplianceCheck[];
+  onOpen: () => void;
 }) {
-  const [busy, setBusy] = useState(false);
+  const meta = latest ? shiftMeta(latest) : null;
+  const usable = latest ? totalOf(latest) !== null : false;
+  const generating = latest?.status === 'pending' || latest?.status === 'running';
+  const head = meta?.label ? `${meta.label} · ${meta.day}` : '';
 
-  if (!period) {
-    return (
-      <div className="rounded-2xl border border-dashed border-border bg-card/60 p-4 sm:p-5">
-        <div className="flex items-center gap-2">
-          <span className="flex size-8 items-center justify-center rounded-lg bg-chart-3/15 text-chart-3">
-            <BarChart3 className="size-4" />
-          </span>
-          <span className="text-base font-semibold">数据中心事件统计表</span>
-          <Badge variant="outline">尚无产出</Badge>
-        </div>
-        <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-          以飞书园区群通报（速报 + 首报）为入口，关联告警与处置工单补全原因、进展与处理时长，
-          全部园区合并成一张班次表（白班 / 夜班）。定时产出开启后每班结束（09:00 夜班 /
-          18:00 白班）自动生成。
-        </p>
-      </div>
-    );
-  }
+  // 一句语境（班次 · 日期）；运行中只说正在生成，指标行隐藏（那是上一轮的数）。
+  const summary = !latest
+    ? loading ? '正在读取最近一期产出…' : '本功能尚未开启定时产出，点开看板可查四项口径与历史期次'
+    : generating ? [head, '正在生成…'].filter(Boolean).join(' · ')
+      : usable ? (head || '本班次已完成')
+        : [head, '无命中数据'].filter(Boolean).join(' · ');
 
-  // 班次类型与期卡同源（period_key 后缀），图标/色调也照期卡来，两处说的是同一班次
-  const meta = shiftMeta(period);
-  const Icon = meta.kind === 'night' ? Moon : meta.kind === 'day' ? Sun : BarChart3;
-  const chip = meta.kind === 'night'
-    ? 'bg-primary/10 text-primary'
-    : meta.kind === 'day' ? 'bg-warning/15 text-warning' : 'bg-chart-3/15 text-chart-3';
-  const title = `数据中心事件统计表${meta.label ? ` · ${meta.label}` : ''}`;
-  const windowText = meta.window || period.window;
+  const metrics = latest && usable && !generating && checks.length
+    ? checks.map((c) => (
+      <ComplianceMetric
+        key={c.key}
+        label={c.name}
+        value={latest.check_counts?.[c.key] ?? 0}
+        cls={visualOf(c.key).chip}
+      />
+    ))
+    : undefined;
 
-  const downloadable = period.parks.filter((p) => p.status === 'success' && p.files.length > 0);
-  // 没有成功产物时后端合并接口会 404，卡片也就不该可点
-  const canOpen = downloadable.length > 0;
-
-  const downloadAll = async () => {
-    if (!downloadable.length || busy) return;
-    setBusy(true);
-    try {
-      await saveIncidentFiles(downloadable);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const open = () => onOpen(period);
+  const metaText = !latest
+    ? '每班 09:00 / 18:00 自动生成'
+    : latest.status === 'failed' ? '最近一期生成失败'
+      : meta?.window ? `窗口 ${meta.window}` : '';
 
   return (
-    <div
-      role={canOpen ? 'button' : undefined}
-      tabIndex={canOpen ? 0 : undefined}
-      onClick={canOpen ? open : undefined}
-      onKeyDown={canOpen ? (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
-      } : undefined}
-      className={cn(
-        'rounded-2xl border border-border bg-card p-4 shadow-sm sm:p-5',
-        canOpen && 'group cursor-pointer transition-all hover:border-primary/40 hover:shadow-md',
-      )}
-    >
-      <div className="flex flex-col gap-5 xl:flex-row xl:items-center">
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={cn('flex size-8 items-center justify-center rounded-lg', chip)}>
-              <Icon className="size-4" />
-            </span>
-            <span className="text-base font-semibold">{title}</span>
-            <span className="text-sm tabular-nums text-muted-foreground">{meta.day}</span>
-            {period.failed > 0 && <Badge variant="destructive">{period.failed} 个任务失败</Badge>}
-          </div>
-          {windowText && (
-            <p className="text-xs tabular-nums text-muted-foreground/80">{windowText}</p>
-          )}
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            以园区群速报 / 首报为入口，关联告警与处置工单补全原因、进展与处理时长
-          </p>
-          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-            <span className="text-4xl font-semibold tracking-tight tabular-nums">
-              {period.total_count}
-            </span>
-            <span className="text-sm text-muted-foreground">条已通报事件</span>
-          </div>
-        </div>
-
-        <div className="flex shrink-0 gap-2 xl:flex-col">
-          {canOpen && (
-            <span className="hidden items-center justify-end gap-0.5 text-[11px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 xl:flex">
-              查看明细 <ArrowUpRight className="size-3.5" />
-            </span>
-          )}
-          <Button size="sm" disabled={!downloadable.length || busy}
-            onClick={(e) => { e.stopPropagation(); void downloadAll(); }}>
-            {busy ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
-            下载本期全部
-          </Button>
-        </div>
-      </div>
-    </div>
+    <ComplianceTile
+      icon={ShieldCheck}
+      tone="bg-primary/10 text-primary"
+      title="告警不合规检查"
+      cadence="按班次"
+      muted={!latest}
+      summary={summary}
+      metrics={metrics}
+      meta={metaText}
+      onClick={onOpen}
+    />
   );
 }
 
@@ -459,9 +265,9 @@ function prevCount(history: ComplianceRun[], run: ComplianceRun, key: string): n
   return prev?.check_counts?.[key];
 }
 
-/** 看板详情：整屏（对齐分析报告），指标卡带 + 构成 + 趋势 + 明细。 */
-function RunBoard({
-  run, data, history, loading, error, activeKey, onActive, onClose,
+/** 单期明细：四张指标卡 + 构成 + 趋势 + 检查项切换 + 表格。 */
+function RunDetail({
+  run, data, history, loading, error, activeKey, onActive,
 }: {
   run: ComplianceRun;
   data: ComplianceRunSheets | null;
@@ -470,264 +276,140 @@ function RunBoard({
   error: string;
   activeKey: string;
   onActive: (key: string) => void;
-  onClose: () => void;
 }) {
   const active = data?.summary.find((s) => s.key === activeKey);
-  const meta = shiftMeta(run);
+
+  if (loading) {
+    return (
+      <div className="flex flex-1 items-center justify-center">
+        <Loader2 className="size-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="flex flex-1 flex-col items-center justify-center gap-2">
+        <XCircle className="size-8 text-destructive/70" />
+        <p className="text-sm text-destructive">{error}</p>
+      </div>
+    );
+  }
+  if (!data) return null;
 
   return (
-    <FullScreenOverlay>
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5">
-        <Button size="sm" variant="ghost" onClick={onClose}>
-          <ArrowLeft className="size-4" /> 返回目录
-        </Button>
-        <span className="min-w-0 flex-1 truncate text-sm font-medium">
-          {run.period_label || run.period_key}
-          {meta.window && <span className="ml-2 text-xs text-muted-foreground">{meta.window}</span>}
-        </span>
-        <Button size="sm" variant="outline" disabled={!hasArtifact(run)}
-          onClick={() => void saveWorkbook(run)}>
-          <Download className="size-4" /> 下载 Excel
-        </Button>
-      </div>
-
-      {loading ? (
-        <div className="flex flex-1 items-center justify-center">
-          <Loader2 className="size-6 animate-spin text-muted-foreground" />
-        </div>
-      ) : error ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-2">
-          <XCircle className="size-8 text-destructive/70" />
-          <p className="text-sm text-destructive">{error}</p>
-        </div>
-      ) : !data ? null : (
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto max-w-6xl space-y-3 p-3 sm:p-4">
-            {/* 指标卡带：命中数 + 口径 + 较上一班增减，点击切明细 */}
-            <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
-              {data.summary.map((s) => {
-                const { Icon, chip } = visualOf(s.key);
-                const prev = prevCount(history, run, s.key);
-                const delta = prev === undefined ? null : s.rows - prev;
-                const selected = s.key === activeKey;
-                return (
-                  <button
-                    key={s.key}
-                    type="button"
-                    onClick={() => onActive(s.key)}
-                    className={cn(
-                      'rounded-xl border bg-card p-3 text-left transition-colors',
-                      selected
-                        ? 'border-primary/50 ring-1 ring-primary/20'
-                        : 'border-border hover:border-primary/30',
-                    )}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className={cn('flex size-7 shrink-0 items-center justify-center rounded-lg', chip)}>
-                        <Icon className="size-3.5" />
-                      </span>
-                      <span className="truncate text-xs text-muted-foreground">{s.name}</span>
-                    </div>
-                    <div className="mt-2 flex items-end gap-2">
-                      <span className={cn(
-                        'text-2xl font-semibold leading-none tracking-tight tabular-nums',
-                        s.rows === 0 && 'text-success',
-                      )}>{s.rows}</span>
-                      <span className="pb-0.5 text-[11px] text-muted-foreground">条</span>
-                      {delta !== null && (
-                        <span
-                          title="较上一同类班次"
-                          className={cn(
-                            'ml-auto pb-0.5 text-[11px] tabular-nums',
-                            delta > 0 ? 'text-destructive'
-                              : delta < 0 ? 'text-success' : 'text-muted-foreground/70',
-                          )}
-                        >
-                          {delta === 0 ? '持平' : `${delta > 0 ? '↑' : '↓'}${Math.abs(delta)}`}
-                        </span>
-                      )}
-                    </div>
-                    <p className="mt-1.5 line-clamp-2 text-[11px] leading-relaxed text-muted-foreground/80">
-                      {s.description}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
-
-            <div className="grid gap-3 lg:grid-cols-2">
-              <Card>
-                <CardContent className="p-4">
-                  <p className="mb-3 text-xs font-medium text-muted-foreground">本期构成</p>
-                  <Composition summary={data.summary} />
-                </CardContent>
-              </Card>
-              <Card>
-                <CardContent className="p-4">
-                  <p className="mb-1 text-xs font-medium text-muted-foreground">近 10 期总命中数</p>
-                  <TrendBars history={history} runId={run.run_id} />
-                </CardContent>
-              </Card>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-1 pt-1">
-              {data.summary.map((s) => {
-                const { Icon } = visualOf(s.key);
-                return (
-                  <button
-                    key={s.key}
-                    type="button"
-                    onClick={() => onActive(s.key)}
-                    className={cn(
-                      'flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm transition-colors',
-                      s.key === activeKey
-                        ? 'border-primary/40 bg-primary/5 text-foreground'
-                        : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground',
-                    )}
-                  >
-                    <Icon className="size-3.5" />
-                    {s.name}
-                    <span className="tabular-nums opacity-70">{s.rows}</span>
-                  </button>
-                );
-              })}
-            </div>
-
-            <Card className="overflow-hidden">
-              <div className="h-[52vh] min-h-[320px]">
-                {active && active.rows === 0 ? (
-                  <div className="flex h-full flex-col items-center justify-center gap-1.5">
-                    <CheckCircle2 className="size-7 text-success/70" />
-                    <p className="text-sm text-muted-foreground">本班次未发现该项不合规</p>
-                    <p className="max-w-lg px-6 text-center text-xs text-muted-foreground/80">
-                      {active.description}
-                    </p>
-                  </div>
-                ) : (
-                  <RecordsTable
-                    key={activeKey}
-                    url={complianceSheetUrl(run.run_id, activeKey)}
-                    name={active?.name ?? activeKey}
-                  />
-                )}
-              </div>
-            </Card>
-          </div>
-        </div>
-      )}
-    </FullScreenOverlay>
-  );
-}
-
-/**
- * 事件统计表整期看板：当期所有园区的行合并成一张表（**不按园区切换** —— 这张表就是
- * 这一班/这一周全园区的事件清单），列与生成的 xlsx 完全一致。
- */
-function IncidentBoard({ period, onClose }: { period: IncidentPeriod; onClose: () => void }) {
-  const [data, setData] = useState<IncidentPeriodSheets | null>(null);
-  const [active, setActive] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    setError('');
-    getIncidentPeriodSheets(period.period_key)
-      .then((d) => {
-        if (!alive) return;
-        setData(d);
-        setActive((cur) => cur || d.sheets[0]?.name || '');
-      })
-      .catch((e) => { if (alive) setError((e as Error).message); })
-      .finally(() => { if (alive) setLoading(false); });
-    return () => { alive = false; };
-  }, [period.period_key]);
-
-  const downloadable = period.parks.filter((p) => p.status === 'success' && p.files.length > 0);
-  const meta = shiftMeta(period);
-  const windowText = meta.window || period.window;
-
-  const downloadAll = async () => {
-    if (!downloadable.length || busy) return;
-    setBusy(true);
-    try {
-      await saveIncidentFiles(downloadable);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <FullScreenOverlay>
-      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-1.5">
-        <Button size="sm" variant="ghost" onClick={onClose}>
-          <ArrowLeft className="size-4" /> 返回目录
-        </Button>
-        <span className="min-w-0 flex-1 truncate text-sm font-medium">
-          {`数据中心事件统计表 · ${period.period_label || period.period_key}`}
-          {windowText && <span className="ml-2 text-xs text-muted-foreground">{windowText}</span>}
-        </span>
-        {period.failed > 0 && <Badge variant="destructive">{period.failed} 个任务失败</Badge>}
-        <Button size="sm" variant="outline"
-          disabled={!downloadable.length || busy || data?.available === false}
-          onClick={() => void downloadAll()}>
-          {busy ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
-          下载 Excel
-        </Button>
-      </div>
-
-      {loading ? (
-        <div className="flex flex-1 items-center justify-center">
-          <Loader2 className="size-6 animate-spin text-muted-foreground" />
-        </div>
-      ) : error ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-2">
-          <XCircle className="size-8 text-destructive/70" />
-          <p className="text-sm text-destructive">{error}</p>
-        </div>
-      ) : !data ? null : data.sheets.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-          <FileSpreadsheet className="size-8 text-muted-foreground/50" />
-          <p className="max-w-md text-sm text-muted-foreground">
-            {data.reason || '该期暂无可预览的明细'}
-          </p>
-        </div>
-      ) : (
-        <div className="flex min-h-0 flex-1 flex-col gap-3 p-3 sm:p-4">
-          <div className="flex flex-wrap items-center gap-1">
-            {data.sheets.map((s) => (
+    <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto max-w-6xl space-y-3 p-3 sm:p-4">
+        {/* 指标卡带：命中数 + 口径 + 较上一班增减，点击切明细 */}
+        <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
+          {data.summary.map((s) => {
+            const { Icon, chip } = visualOf(s.key);
+            const prev = prevCount(history, run, s.key);
+            const delta = prev === undefined ? null : s.rows - prev;
+            const selected = s.key === activeKey;
+            return (
               <button
                 key={s.key}
                 type="button"
-                onClick={() => setActive(s.name)}
+                onClick={() => onActive(s.key)}
+                className={cn(
+                  'rounded-xl border bg-card p-3 text-left transition-colors',
+                  selected
+                    ? 'border-primary/50 ring-1 ring-primary/20'
+                    : 'border-border hover:border-primary/30',
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  <span className={cn('flex size-7 shrink-0 items-center justify-center rounded-lg', chip)}>
+                    <Icon className="size-3.5" />
+                  </span>
+                  <span className="truncate text-xs text-muted-foreground">{s.name}</span>
+                </div>
+                <div className="mt-2 flex items-end gap-2">
+                  <span className={cn(
+                    'text-2xl font-semibold leading-none tracking-tight tabular-nums',
+                    s.rows === 0 && 'text-success',
+                  )}>{s.rows}</span>
+                  <span className="pb-0.5 text-[11px] text-muted-foreground">条</span>
+                  {delta !== null && (
+                    <span
+                      title="较上一同类班次"
+                      className={cn(
+                        'ml-auto pb-0.5 text-[11px] tabular-nums',
+                        delta > 0 ? 'text-destructive'
+                          : delta < 0 ? 'text-success' : 'text-muted-foreground/70',
+                      )}
+                    >
+                      {delta === 0 ? '持平' : `${delta > 0 ? '↑' : '↓'}${Math.abs(delta)}`}
+                    </span>
+                  )}
+                </div>
+                <p className="mt-1.5 line-clamp-2 text-[11px] leading-relaxed text-muted-foreground/80">
+                  {s.description}
+                </p>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="grid gap-3 lg:grid-cols-2">
+          <Card>
+            <CardContent className="p-4">
+              <p className="mb-3 text-xs font-medium text-muted-foreground">本期构成</p>
+              <Composition summary={data.summary} />
+            </CardContent>
+          </Card>
+          <Card>
+            <CardContent className="p-4">
+              <p className="mb-1 text-xs font-medium text-muted-foreground">近 10 期总命中数</p>
+              <TrendBars history={history} runId={run.run_id} />
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1 pt-1">
+          {data.summary.map((s) => {
+            const { Icon } = visualOf(s.key);
+            return (
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => onActive(s.key)}
                 className={cn(
                   'flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-sm transition-colors',
-                  s.name === active
+                  s.key === activeKey
                     ? 'border-primary/40 bg-primary/5 text-foreground'
                     : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground',
                 )}
               >
+                <Icon className="size-3.5" />
                 {s.name}
                 <span className="tabular-nums opacity-70">{s.rows}</span>
               </button>
-            ))}
-          </div>
+            );
+          })}
+        </div>
 
-          <Card className="min-h-0 flex-1 overflow-hidden">
-            {active && (
+        <Card className="overflow-hidden">
+          <div className="h-[52vh] min-h-[320px]">
+            {active && active.rows === 0 ? (
+              <div className="flex h-full flex-col items-center justify-center gap-1.5">
+                <CheckCircle2 className="size-7 text-success/70" />
+                <p className="text-sm text-muted-foreground">本班次未发现该项不合规</p>
+                <p className="max-w-lg px-6 text-center text-xs text-muted-foreground/80">
+                  {active.description}
+                </p>
+              </div>
+            ) : (
               <RecordsTable
-                key={`${period.period_key}:${active}`}
-                url={incidentPeriodSheetUrl(period.period_key, active)}
-                name={active}
-                adaptive
+                key={activeKey}
+                url={complianceSheetUrl(run.run_id, activeKey)}
+                name={active?.name ?? activeKey}
               />
             )}
-          </Card>
-        </div>
-      )}
-    </FullScreenOverlay>
+          </div>
+        </Card>
+      </div>
+    </div>
   );
 }
 
@@ -754,11 +436,101 @@ function CheckSpecs({ checks }: { checks: ComplianceCheck[] }) {
   );
 }
 
-export default function CompliancePage() {
-  const [spec, setSpec] = useState<ComplianceSpec | null>(null);
+/** 一期一行（按期浏览）。四项计数与窗口在窄屏收起，只留期次 / 状态 / 总命中 / 下载。 */
+function PeriodRow({
+  run, checks, onOpen,
+}: {
+  run: ComplianceRun;
+  checks: ComplianceCheck[];
+  onOpen: (run: ComplianceRun) => void;
+}) {
+  const meta = shiftMeta(run);
+  const counts = run.check_counts;
+  const total = totalOf(run);
+  const usable = total !== null;
+  const Icon = meta.kind === 'night' ? Moon : Sun;
+
+  return (
+    <tr
+      tabIndex={0}
+      onClick={() => onOpen(run)}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(run); }
+      }}
+      title={run.status === 'failed' ? (run.error || '生成失败') : `${run.period_label}｜${run.teaser}`}
+      className="cursor-pointer border-t border-border transition-colors hover:bg-muted/40 focus:bg-muted/40 focus:outline-none"
+    >
+      <td className="px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <span className={cn(
+            'flex size-7 shrink-0 items-center justify-center rounded-lg',
+            meta.kind === 'night' ? 'bg-primary/10 text-primary' : 'bg-warning/15 text-warning',
+          )}>
+            <Icon className="size-3.5" />
+          </span>
+          <span className="min-w-0">
+            <span className="block font-medium">
+              {meta.label} · <span className="tabular-nums">{meta.day}</span>
+            </span>
+            <span className="block truncate text-[11px] tabular-nums text-muted-foreground/80 xl:hidden">
+              {meta.window || run.period_key}
+            </span>
+          </span>
+        </div>
+      </td>
+      <td className="hidden whitespace-nowrap px-3 py-2.5 text-[11px] tabular-nums text-muted-foreground lg:table-cell">
+        {meta.window || '—'}
+      </td>
+      <td className="px-3 py-2.5"><StatusBadge run={run} /></td>
+      {checks.map((c) => {
+        const value = counts?.[c.key];
+        const { Icon: CheckIcon, chip } = visualOf(c.key);
+        return (
+          <td key={c.key} className="hidden whitespace-nowrap px-2 py-2.5 text-right xl:table-cell">
+            <span
+              className={cn(
+                'inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs tabular-nums',
+                value ? chip : 'text-muted-foreground/50',
+              )}
+              title={c.name}
+            >
+              <CheckIcon className="size-3" />
+              {value ?? '—'}
+            </span>
+          </td>
+        );
+      })}
+      <td className={cn(
+        'px-3 py-2.5 text-right text-base font-semibold tabular-nums',
+        usable && total === 0 ? 'text-success' : !usable ? 'text-muted-foreground/60' : '',
+      )}>{usable ? total : '—'}</td>
+      <td className="hidden whitespace-nowrap px-3 py-2.5 text-right text-[11px] tabular-nums text-muted-foreground lg:table-cell">
+        {fmtShort(run.triggered_at)}
+        {run.duration_ms > 0 && (
+          <span className="opacity-70"> · {(run.duration_ms / 1000).toFixed(0)}s</span>
+        )}
+      </td>
+      <td className="px-3 py-2.5 text-right">
+        <Button size="xs" variant="ghost" disabled={!hasArtifact(run)}
+          onClick={(e) => { e.stopPropagation(); void saveWorkbook(run); }}
+          onKeyDown={(e) => e.stopPropagation()}
+          title="下载 Excel">
+          <Download className="size-3.5" />
+        </Button>
+      </td>
+    </tr>
+  );
+}
+
+/**
+ * 告警不合规检查看板：**按期浏览**。默认是期次列表（日期区间 + 班次筛选 + 分页），
+ * 点某期进入该期明细（指标卡 / 构成 / 趋势 / 四项明细表），面包屑可回列表。
+ * 列表与明细共用一个 overlay 与顶栏 —— `BoardHeader` portal 的是同一个插槽，
+ * 两个 overlay 叠起来会渲染出两套面包屑。
+ */
+function ComplianceBoard({ checks, onClose }: { checks: ComplianceCheck[]; onClose: () => void }) {
   const [runs, setRuns] = useState<ComplianceRun[]>([]);
-  const [incident, setIncident] = useState<IncidentPeriod | null>(null);
-  const [incidentDetail, setIncidentDetail] = useState<IncidentPeriod | null>(null);
   const [total, setTotal] = useState(0);
   const [statusCounts, setStatusCounts] = useState<Record<string, number>>({});
   const [page, setPage] = useState(1);
@@ -766,13 +538,11 @@ export default function CompliancePage() {
   const [cadence, setCadence] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [view, setView] = useState<ComplianceRun | null>(null);
   const [detail, setDetail] = useState<{
-    run: ComplianceRun; data: ComplianceRunSheets | null; loading: boolean;
-    error: string; activeKey: string;
+    data: ComplianceRunSheets | null; loading: boolean; error: string; activeKey: string;
   } | null>(null);
-  const listRef = useRef<HTMLDivElement>(null);
 
-  const checks = spec?.checks ?? [];
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   const load = async (pageNo: number) => {
@@ -797,67 +567,41 @@ export default function CompliancePage() {
     }
   };
 
-  // 事件统计表与本页产物互不依赖：任一失败都不能让另一块变成空白
-  const loadIncident = async () => {
-    try {
-      const periods = await listIncidentPeriods(1);
-      setIncident(periods[0] ?? null);
-    } catch {
-      setIncident(null);
-    }
-  };
-
-  useEffect(() => {
-    // 检查项注册表与产物清单互不依赖：注册表失败不能让页面变成空白
-    getComplianceSpec().then(setSpec).catch(() => setSpec(null));
-    void loadIncident();
-  }, []);
-
   useEffect(() => { void load(1); }, [range, cadence]);
 
-  const openRun = async (run: ComplianceRun, key = '') => {
-    setDetail({ run, data: null, loading: true, error: '', activeKey: key });
+  const openRun = async (run: ComplianceRun) => {
+    setView(run);
+    setDetail({ data: null, loading: true, error: '', activeKey: '' });
     try {
       const data = await getComplianceRunSheets(run.run_id);
       setDetail((cur) => (cur ? {
         ...cur, data, loading: false,
-        activeKey: key || data.sheets[0]?.key || '',
+        activeKey: cur.activeKey || data.sheets[0]?.key || '',
       } : cur));
     } catch (e) {
       setDetail((cur) => (cur ? { ...cur, loading: false, error: (e as Error).message } : cur));
     }
   };
 
+  const backToList = () => { setView(null); setDetail(null); };
+
   const goPage = (p: number) => {
     const target = Math.min(Math.max(1, p), totalPages);
     if (target === page || loading) return;
     void load(target);
-    listRef.current?.scrollIntoView({ block: 'start' });
   };
 
-  if (detail) {
-    return (
-      <RunBoard
-        run={detail.run}
-        data={detail.data}
-        history={runs}
-        loading={detail.loading}
-        error={detail.error}
-        activeKey={detail.activeKey}
-        onActive={(key) => setDetail((cur) => (cur ? { ...cur, activeKey: key } : cur))}
-        onClose={() => setDetail(null)}
-      />
-    );
-  }
+  const active = detail?.data?.summary.find((s) => s.key === detail.activeKey);
+  const meta = view ? shiftMeta(view) : null;
 
-  if (incidentDetail) {
-    return (
-      <IncidentBoard
-        period={incidentDetail}
-        onClose={() => setIncidentDetail(null)}
-      />
-    );
-  }
+  const crumbs: Crumb[] = [
+    { label: '合规检查', onClick: onClose },
+    { label: '告警不合规检查', onClick: view ? backToList : undefined },
+    ...(view
+      ? [{ label: view.period_label || view.period_key },
+        ...(active ? [{ label: active.name }] : [])]
+      : []),
+  ];
 
   const hasCounts = Object.keys(statusCounts).length > 0;
   const succeeded = hasCounts ? (statusCounts.success ?? 0)
@@ -866,96 +610,194 @@ export default function CompliancePage() {
     : runs.filter((r) => r.status === 'failed').length;
 
   return (
+    <FullScreenOverlay>
+      <BoardHeader
+        onBack={view ? backToList : onClose}
+        crumbs={crumbs}
+        meta={meta?.window ? <span>{meta.window}</span> : undefined}
+        actions={view ? (
+          <Button size="sm" variant="outline" className="shrink-0" title="下载 Excel"
+            disabled={!hasArtifact(view)} onClick={() => void saveWorkbook(view)}>
+            <Download className="size-4" />
+            <span className="hidden sm:inline">下载 Excel</span>
+          </Button>
+        ) : (
+          <Button size="sm" variant="ghost" className="shrink-0" disabled={loading}
+            onClick={() => void load(page)}>
+            <RefreshCw className="size-4" />
+            <span className="hidden sm:inline">刷新</span>
+          </Button>
+        )}
+      />
+
+      {view ? (
+        <RunDetail
+          run={view}
+          data={detail?.data ?? null}
+          history={runs}
+          loading={detail?.loading ?? true}
+          error={detail?.error ?? ''}
+          activeKey={detail?.activeKey ?? ''}
+          onActive={(key) => setDetail((cur) => (cur ? { ...cur, activeKey: key } : cur))}
+        />
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col gap-3 p-3 sm:p-4">
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card p-2 shadow-sm">
+            <DateRangeFilter value={range} onChange={setRange} />
+            <FilterSelect
+              icon={Clock} ariaLabel="按班次筛选"
+              value={cadence} options={CADENCE_OPTS}
+              onChange={(v) => setCadence(String(v))}
+            />
+            <span className="ml-auto px-1 text-xs tabular-nums text-muted-foreground">
+              共 {total} 期
+            </span>
+          </div>
+
+          {error && <p className="text-sm text-destructive">{error}</p>}
+
+          {loading ? (
+            <div className="flex flex-1 items-center justify-center">
+              <Loader2 className="size-6 animate-spin text-muted-foreground" />
+            </div>
+          ) : runs.length === 0 ? (
+            <div className="min-h-0 flex-1 space-y-4 overflow-y-auto">
+              <Card>
+                <CardContent className="flex flex-col items-center gap-2 py-14">
+                  <FileSpreadsheet className="size-8 text-muted-foreground/50" />
+                  <p className="text-sm text-muted-foreground">
+                    {range || cadence ? '该筛选条件下没有产出' : '还没有产出'}
+                  </p>
+                  <p className="text-xs text-muted-foreground/80">
+                    {range || cadence
+                      ? '换个日期区间或班次看看'
+                      : '本功能尚未开启定时产出，开启后每班（09:00 / 18:00）自动生成'}
+                  </p>
+                </CardContent>
+              </Card>
+              {checks.length > 0 && <CheckSpecs checks={checks} />}
+            </div>
+          ) : (
+            <>
+              <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-border bg-card">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 z-10 bg-muted/30 text-xs text-muted-foreground">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-medium">期次</th>
+                      <th className="hidden px-3 py-2 text-left font-medium lg:table-cell">窗口</th>
+                      <th className="px-3 py-2 text-left font-medium">状态</th>
+                      {checks.map((c) => (
+                        <th key={c.key} className="hidden px-2 py-2 text-right font-medium xl:table-cell">
+                          {c.name}
+                        </th>
+                      ))}
+                      <th className="px-3 py-2 text-right font-medium">总命中</th>
+                      <th className="hidden px-3 py-2 text-right font-medium lg:table-cell">生成时间</th>
+                      <th className="px-3 py-2 text-right font-medium">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {runs.map((r) => (
+                      <PeriodRow key={r.run_id} run={r} checks={checks} onOpen={(x) => void openRun(x)} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
+                <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                  <span>共 <b className="text-foreground tabular-nums">{total}</b> 期产出</span>
+                  <span className="flex items-center gap-2">
+                    <span className="flex items-center gap-1">
+                      <CheckCircle2 className="size-3.5 text-success" />{succeeded}
+                    </span>
+                    {failed > 0 && (
+                      <span className="flex items-center gap-1">
+                        <XCircle className="size-3.5 text-destructive" />{failed}
+                      </span>
+                    )}
+                  </span>
+                </div>
+                {totalPages > 1 && (
+                  <div className="flex items-center gap-1">
+                    <Button size="xs" variant="outline" disabled={page <= 1 || loading}
+                      onClick={() => goPage(page - 1)}>上一页</Button>
+                    <span className="px-2 text-xs tabular-nums text-muted-foreground">
+                      {page} / {totalPages}
+                    </span>
+                    <Button size="xs" variant="outline" disabled={page >= totalPages || loading}
+                      onClick={() => goPage(page + 1)}>下一页</Button>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </FullScreenOverlay>
+  );
+}
+
+export default function CompliancePage() {
+  const [spec, setSpec] = useState<ComplianceSpec | null>(null);
+  const [latestRun, setLatestRun] = useState<ComplianceRun | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [boardOpen, setBoardOpen] = useState(false);
+
+  const checks = spec?.checks ?? [];
+
+  // 页面只取最近一期给汇总卡用；完整期次列表在 ComplianceBoard 里按筛选分页加载
+  const loadLatest = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await listComplianceRuns({ limit: 1 });
+      setLatestRun(data.runs[0] ?? null);
+    } catch {
+      setError('加载失败，请刷新重试');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // 检查项注册表与产物清单互不依赖：注册表失败不能让页面变成空白
+    getComplianceSpec().then(setSpec).catch(() => setSpec(null));
+    void loadLatest();
+  }, []);
+
+  return (
     <PlatformShell
       title="合规检查"
-      description="按班次核对告警处置不合规与园区事件统计，按月度跟踪平台资料更新，按需检测红外巡检图片质量"
+      description="按班次核对告警处置不合规，按月度跟踪平台资料更新，按需检测红外巡检图片质量，按周审查应急演练记录"
       actions={(
-        <Button size="sm" variant="ghost"
-          onClick={() => { void load(page); void loadIncident(); }}>
+        <Button size="sm" variant="ghost" onClick={() => { void loadLatest(); }}>
           <RefreshCw className="size-4" /> 刷新
         </Button>
       )}
     >
-      <div className="space-y-4" ref={listRef}>
-        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card p-2 shadow-sm">
-          <DateRangeFilter value={range} onChange={setRange} />
-          <FilterSelect
-            icon={Clock} ariaLabel="按班次筛选"
-            value={cadence} options={CADENCE_OPTS}
-            onChange={(v) => setCadence(String(v))}
-          />
-          <span className="ml-auto px-1 text-xs tabular-nums text-muted-foreground">
-            共 {total} 期
-          </span>
-        </div>
-
+      <div className="space-y-4">
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        {loading ? (
-          <div className="flex justify-center py-20">
-            <Loader2 className="size-6 animate-spin text-muted-foreground" />
-          </div>
-        ) : runs.length === 0 ? (
-          <div className="space-y-4">
-            <DocUpdatePanel />
-            <IncidentHero period={incident} onOpen={setIncidentDetail} />
-            <InfraredQualityPanel />
-            <Card>
-              <CardContent className="flex flex-col items-center gap-2 py-14">
-                <FileSpreadsheet className="size-8 text-muted-foreground/50" />
-                <p className="text-sm text-muted-foreground">
-                  {range || cadence ? '该筛选条件下没有产出' : '还没有产出'}
-                </p>
-                <p className="text-xs text-muted-foreground/80">
-                  {range || cadence
-                    ? '换个日期区间或班次看看'
-                    : '本功能尚未开启定时产出，开启后每个班次（09:00 / 18:00）自动生成'}
-                </p>
-              </CardContent>
-            </Card>
-            {checks.length > 0 && <CheckSpecs checks={checks} />}
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <DocUpdatePanel />
-            <IncidentHero period={incident} onOpen={setIncidentDetail} />
-            <InfraredQualityPanel />
-
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
-              {runs.map((r) => (
-                <ShiftCard key={r.run_id} run={r} checks={checks} onOpen={(x) => void openRun(x)} />
-              ))}
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
-              <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                <span>共 <b className="text-foreground tabular-nums">{total}</b> 期产出</span>
-                <span className="flex items-center gap-2">
-                  <span className="flex items-center gap-1">
-                    <CheckCircle2 className="size-3.5 text-success" />{succeeded}
-                  </span>
-                  {failed > 0 && (
-                    <span className="flex items-center gap-1">
-                      <XCircle className="size-3.5 text-destructive" />{failed}
-                    </span>
-                  )}
-                </span>
-              </div>
-              {totalPages > 1 && (
-                <div className="flex items-center gap-1">
-                  <Button size="xs" variant="outline" disabled={page <= 1 || loading}
-                    onClick={() => goPage(page - 1)}>上一页</Button>
-                  <span className="px-2 text-xs tabular-nums text-muted-foreground">
-                    {page} / {totalPages}
-                  </span>
-                  <Button size="xs" variant="outline" disabled={page >= totalPages || loading}
-                    onClick={() => goPage(page + 1)}>下一页</Button>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
+        <DocUpdatePanel />
+        <CompliancePanel
+          latest={latestRun}
+          loading={loading}
+          checks={checks}
+          onOpen={() => setBoardOpen(true)}
+        />
+        <InfraredQualityPanel />
+        <DrillAuditPanel />
       </div>
+
+      {/* 看板 portal 到 body；关闭时顺手刷新最近一期，避免汇总卡落后 */}
+      {boardOpen && (
+        <ComplianceBoard
+          checks={checks}
+          onClose={() => { setBoardOpen(false); void loadLatest(); }}
+        />
+      )}
     </PlatformShell>
   );
 }

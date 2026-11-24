@@ -168,7 +168,7 @@ def test_parse_new_format():
   ]
   paths = ['/tmp/a/001.jpg', '/tmp/a/002.jpg', '/tmp/a/003.jpg', '/tmp/a/004.jpg']
   out = predict.parse_rows(HEADERS, rows, paths)
-  # 模型分数取**预测类别那一列**的原值（带 % 的字符串）
+  # 置信度取**预测类别那一列**的原值（带 % 的字符串）
   assert out['/tmp/a/001.jpg'] == {'label': 'sharp', 'score': '97.9%', 'error': ''}
   assert out['/tmp/a/002.jpg'] == {'label': 'borderline', 'score': '87.4%', 'error': ''}
   assert out['/tmp/a/003.jpg'] == {'label': '', 'score': None, 'error': '模型超时'}

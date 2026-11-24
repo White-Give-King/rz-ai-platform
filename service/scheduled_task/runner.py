@@ -74,6 +74,28 @@ async def run_task(task) -> None:
     await run_doc_update_task(task)
     return
 
+  # 应急演练周审查预设（`drill_audit__…`）：扫描到点该审的演练周并落结论，不建 agent
+  if (getattr(task, 'template_id', '') or '').startswith('drill_audit__'):
+    from service.drill_audit.weekly import run_weekly_task
+
+    await run_weekly_task(task)
+    return
+
+  # 每日变更统计（`change_notice__…`）：读群消息解析，出 xlsx，不建 agent、不调 LLM
+  if (getattr(task, 'template_id', '') or '').startswith('change_notice__'):
+    from service.scheduled_task.change_notice.workflow import run_change_notice_task
+
+    await run_change_notice_task(task)
+    return
+
+  # 变更通知合规周报（`changenotice__…`，注意**无下划线**，与上面 `change_notice__` 互不匹配）：
+  # 同一份群消息数据，按可扩展规则表判合规、出 PDF，不建 agent、不调 LLM
+  if (getattr(task, 'template_id', '') or '').startswith('changenotice__'):
+    from service.scheduled_task.change_notice.weekly_report import run_change_compliance_task
+
+    await run_change_compliance_task(task)
+    return
+
   # 登记了确定性 spec 的预设（如事件工单）走工作流：取数/统计/出图/排版全平台完成，
   # 只留一次无工具的 LLM 调用来写解读 —— 不再付 agent 那 ~29.5k tokens 的固定开销与多轮 prefill。
   from service.scheduled_task.report import get_report_spec

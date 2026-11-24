@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Select } from '@/components/ui/select';
+import { useConfirm } from '@/components/confirm-dialog';
 import { getAccessToken } from '@/api/client';
 import { MessageBubble } from '@/components/ChatArea';
 import type { Message } from '@/types';
@@ -177,6 +178,7 @@ const PRESET_LABEL: Record<Preset, string> = {
 };
 
 export default function ScheduledTasksPage() {
+  const confirm = useConfirm();
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
@@ -276,7 +278,12 @@ export default function ScheduledTasksPage() {
   };
 
   const onDelete = async (t: ScheduledTask) => {
-    if (!window.confirm(`确定删除定时任务「${t.name}」？`)) return;
+    const ok = await confirm({
+      title: `删除定时任务「${t.name}」？`,
+      confirmText: '删除',
+      variant: 'destructive',
+    });
+    if (!ok) return;
     await deleteTask(t.task_id);
     await load();
   };

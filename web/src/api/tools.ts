@@ -31,8 +31,33 @@ async function unwrap<T>(resp: { data: { data: T } }): Promise<T> {
   return resp.data.data;
 }
 
+let cache: ToolGroup[] | null = null;
+let inflight: Promise<ToolGroup[]> | null = null;
+
+/** 同步取缓存：进页面已预取过则打开小窗直接渲染，不闪加载态 */
+export function getCachedTools(): ToolGroup[] | null {
+  return cache;
+}
+
+/** 进页面预取；失败静默，首次打开小窗会重试并提示 */
+export function prefetchTools(): void {
+  void listTools().catch(() => {});
+}
+
 export async function listTools(): Promise<ToolGroup[]> {
-  const resp = await client.get('/tools');
-  const data = await unwrap<{ groups: ToolGroup[] }>(resp);
-  return data.groups ?? [];
+  if (cache) return cache;
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const resp = await client.get('/tools');
+        const data = await unwrap<{ groups: ToolGroup[] }>(resp);
+        const groups = data.groups ?? [];
+        cache = groups;
+        return groups;
+      } finally {
+        inflight = null;
+      }
+    })();
+  }
+  return inflight;
 }

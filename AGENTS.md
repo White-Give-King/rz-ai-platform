@@ -14,6 +14,18 @@ pip install -r requirements.txt
 # 本地已有则复用、缓存写入必须是 pymongo UpdateOne
 python -m service.infrared_quality.tests.test_infrared_quality
 
+# 应急演练合规审查自检（29 项，纯 assert、不联网）：码表解码、周次选择（优先已完成/有记录）、
+# 判定 JSON 解析与缺依据丢弃、解析失败放宽上限重试一次、无 EOP → 无法判定、mock 模型端到端、
+# 空 PDF 返回空串、检索不可用抛 EopRetrievalError、流程图挂到 groups[].flow（无图组不加键）、
+# 维度判定（5 键补齐/无据降级）、EOP 步骤结构化与漏做镜像进 issues、步骤耗时指标、
+# step_findings 服务端覆盖 actual、旧结构兼容
+python -m service.drill_audit.tests.test_drill_audit
+# 内容库自检（5 项，临时目录，不连 Mongo、不联网）：路径分片/原子写读回/字节统计/淘汰顺序
+python -m service.drill_audit.tests.test_store
+# 本机核对（dry-run 只定位计划/周/班组 + 预览 EOP 命中；--yes 才下载+OCR+判定；
+# --refresh 绕过内容库、--store-stats 只看统计、--store-max-mb 临时压上限）
+python -m service.drill_audit.cli --dept 23CI1EiZnff --year 2026 --plan-name "制冷单元故障+电动阀门故障应急操作演练"
+
 # 页面操作自检（纯 assert，不连网、不启浏览器）：
 # recipes = 配方参数/主机白名单/截图原子发布；interactive = 交互 6 工具/会话 id/导航校验/返回整形
 python -m service.query.browser.tests.test_recipes
@@ -113,7 +125,7 @@ api/v1/     →  service/    →  core/       →  config/
 
 - `service/agent/agent_service.py` — AgentService 单例：`stream()` 设 RBAC contextvar (`guardrail.set_current_permissions`) → `_ensure_agent()` 按开关注册平台、装配工具、构建图、创建 Checkpointer → 多标签编排 `build_initial_state` → `stream_agent`
 - `core/agent/prompts.py` — `SYSTEM_PROMPT`（工作原则、`<chart>` 图表输出规范、报告生成规范、HTML 看板生成规范）
-- **工具集**：基础工具 `[rag_knowledge_search, get_current_time, send_notification]`；`AGENT_ANALYSIS_ENABLED` 时追加分析工具 `build_analysis_tools()`；任一 `<PLATFORM>_ENABLED` 开启时把已注册平台能力生成为平台工具（deferred，见下）；另有历史归档回读 `history_search` / `history_read`（见「摘要」）
+- **工具集**：**常驻底座**只有 `[rag_knowledge_search, get_current_time, send_notification]` + 分析沙箱（`AGENT_ANALYSIS_ENABLED`）+ 上传 + 历史回读 `history_search` / `history_read` + `write_todos`；任一 `<PLATFORM>_ENABLED` 开启时把已注册平台能力生成为平台工具（deferred，见下）。**其余内置工具（22 个）并入同一个 deferred catalog / `tool_search`**（`incident_*` / `change_notice_report` / `event_alarm_link` / `drill_compliance_audit` / `doc_update_check` / `schedule_task` / `skill_manage` / `stage_skill_script` / 视频 8 个 / 飞书 4 个），schema 不再每轮常驻：没有 capability 身份，检索走 `build_tool_search(..., extra_entries={工具名: 标题+描述})` 的第二路索引（`retriever.search_entries_scored`），命中后同样 `catalog.by_name` + promote；`<available-tools>` 之后追加 `<extension-tools>` 段列出实际注册的扩展桶（`manifest.build_deferred_builtin_hint`）。**常用说法由 `orchestrator.match_builtin_tools` 正则预 promote**（讲解视频 / 飞书群 / 事件统计 / 日常变更 / 关联告警 / 演练合规 / 文档检查 / 定时任务），命中即独占返回、跳过后续关键词与分类过滤；表里**只登记工具名、不登记技能**，也不登记裸词（`视频`/`演练`/`变更统计`/`事件` 各有既有归属）。**传了未声明参数会明确报错**：`_ArgsModel` 用 `extra='allow'` 让多传的键进 `**kwargs`，`_run` 返回「不支持的参数：…」；`analysis_load` 同样校验 `set(params) - set(cap.params)`。**不能改 `extra='forbid'`**（`ToolNode` 只吞 `ToolInvocationError`，`ValidationError` 会掐断整轮流），发给模型的 schema 保持逐字一致（`model_json_schema` 剥掉 `additionalProperties`）。静默丢参的代价是把「传错参数名」退化成「按无参数全表扫」（实测传 `date` 给告警能力捞出 295 万条）
 - **middleware 链**（`core/agent/middlewares/`）：`DanglingToolCallMiddleware`（修补悬空 tool 调用/孤儿 tool 结果，防严格后端 400）→ `DurableContextMiddleware`（注入摘要+归档状态，防压缩丢失）→ `SummarizationMiddleware`（超阈值压缩旧消息）→ `DeferredToolFilterMiddleware`（海量工具 schema 隐藏/按需 promote）。另有 `audit.py` / `guardrail.py` / `loop_detect.py` / `rag_inject.py` / `tool_error.py`
 - **Checkpointer** — `core/agent/checkpointer.py` `create_checkpointer()`：`AGENT_CHECKPOINT_BACKEND` 三选（memory 默认 / postgres），postgres 用 `AsyncPostgresSaver` + 连接池，进程退出前 `teardown()`
 - **promoted channel 必须带 `merge_promoted` reducer** — `core/agent/state.py` 的 `RzAgentState.promoted` 必须是 `Annotated[..., merge_promoted]`：`tool_search` 每命中一次就写一次 promoted，若退化成 last-write-wins，会把编排层预 promote 的工具（联网调研模式的 `web__search`/`web__fetch`）整体顶掉 —— 实测 bug：模型一轮里只要调过一次 `tool_search`，联网工具就再也看不见了（同 hash 累积、换 hash 整体替换）
@@ -129,6 +141,7 @@ api/v1/     →  service/    →  core/       →  config/
         → 未命中时 LLM 用 tool_search 语义检索 promote 所需工具
 ```
 - 能力集稳定前 `intent_bindings.all_intent_labels()` 为空时跳过编排（省一次白付的 LLM 调用）
+- **内置正则路由排在最前**：`orchestrator._route` 先跑 `match_builtin_tools(message, known_names)`，命中即独占返回、跳过平台关键词与分类过滤（`事件统计` 含「事件」、「日常变更」含「变更」、「演练合规」含「演练」，不先跑就会被平台表截走）；`known_names` 过滤掉未注册/开关关掉的工具
 - 并行/串行工具调用由 LangGraph ToolNode 执行，调度方式（单/多/串行/并行）由 LLM 自主决定
 
 **平台能力注册（见「平台能力」节）：**
@@ -156,7 +169,7 @@ service/query/bootstrap.py register_enabled_platforms()
 | web 联网 | 2 条 | `WEB_ENABLED`（默认关） | `web__search`（自建 SearXNG 检索）/ `web__fetch`（抓取公网网页）。**模式门控**：只在「联网调研」模式（`task_mode='research'`）或输入栏「联网搜索」开关（`web_search=true`）下可见，其他情况不进分类清单/不进 planner 词汇表/不进 tool_search 检索目录 |
 | browser 页面操作 | 按已校准配方注册 + 交互模式 7 条 | `BROWSER_ENABLED` / `BROWSER_EXPLORE_ENABLED`（默认关） | 按声明式配方进入内网系统页面、设参数筛选后截图，并返回页面表格与正文；交互模式另提供 navigate/snapshot/click/get_text/screenshot/record/close 逐步操作（record 在当前页面录固定时长，交付关键帧 + 可选 webm；危险按钮在快照标 blocked、点击被拒）。执行在独立 Playwright 旁路容器（`deploy/browser/`），后端只持有配方，会话在容器内按 thread_id 派生 id 共享（多 worker 可命中同一会话）。截图走会话产物链路内联显示。**模板配方 `enabled=False`，未校准前不注册能力**；要精确数据请用对应平台的数据查询，不要用截图替代。详见 `docs/features/browser-capture.md` |
 - **联网调研模式（research）/ 联网搜索开关** — 能力范围：仅 `web.search`/`web.fetch`（搜索走自建 SearXNG，`WEB_SEARCH_BASE_URL`；抓取只允许公网 http/https）。门控三层（缺一不可）：① 构建期 `MODE_GATED_PLATFORMS` 排除出 `<available-tools>` 与意图绑定表；② `build_deferred_setup(extra_hidden=...)` 让它不进 `tool_search` 检索目录、schema 默认隐藏、硬调被拦；③ `orchestrator.build_initial_state` 预 promote 才可见（`task_mode='research'` 或 `web_search=true` 任一即放开）。SSRF：`service/query/web/url_safety.py`（`not is_global or is_multicast`，含 CGNAT 100.64/10）+ **重定向逐跳复校验**（`follow_redirects=False`）。审计：每次检索/抓取 fire-and-forget 落 `web_queries`（query/url 原文 + 来源域名），出方向不做管控，审计是唯一追溯手段。事实污染：`MODE_INSTRUCTIONS['research']` 要求外部来源就地 `[citation:标题](URL)` + 文末 Sources 段，并强制「内外分开陈述、冲突以内部数据为准」；`citations` 已进不可信内容 denylist。**只放开工具、不注入规范**是开关与任务模式的分界（刻意解绑）
-| skill 技能平台 | analysis 1+0（怎么算：聚合形状/pandas 写法/交互表格整理）、chart 1+26（怎么画：选型+字段规范）、html_dashboard 1+1、skill_creator 1+0、deep_research 1+0（联网调研方法论，配合联网调研模式）、company_profile 1+0（公司背景档案，按需加载，不常驻；元规则 11 引导）、consulting_analysis 1+2（专业分析报告方法论：Phase1 分析框架 + Phase2 成文，含数据真实性协议） （另有用户自建技能动态增减） | 无开关常驻 | `skills/` 目录自动发现（SKILL.md + references），零代码接入新技能；用户自建技能存 `skills/users/<uid>/`，按用户隔离。技能中心列表读**进程内技能快照**（启动时建立，写盘/删除经 `reload_skills()` 刷新，不按请求扫盘；多 worker 下其余进程重启后跟上）；详情展示概述 + 使用场景（frontmatter `when_to_use`，缺失回退描述后续句）+ 分类/领域/类型 + 附带文档，**不展示 SKILL.md 原文**，详情字段随列表一次下发、点击不再请求接口 |
+| skill 技能平台 | analysis 1+0（怎么算：聚合形状/pandas 写法/交互表格整理）、chart 1+26（怎么画：选型+字段规范）、html_dashboard 1+1、skill_creator 1+0、deep_research 1+0（联网调研方法论，配合联网调研模式）、company_profile 1+0（公司背景档案，按需加载，不常驻；元规则 11 引导）、consulting_analysis 1+2（专业分析报告方法论：Phase1 分析框架 + Phase2 成文，含数据真实性协议） （另有用户自建技能动态增减） | 无开关常驻 | `skills/` 目录自动发现（SKILL.md + references），零代码接入新技能；用户自建技能存 `skills/users/<uid>/`，按用户隔离。智能体页列表读**进程内技能快照**（启动时建立，写盘/删除经 `reload_skills()` 刷新，不按请求扫盘；多 worker 下其余进程重启后跟上）；详情展示概述 + 使用场景（frontmatter `when_to_use`，缺失回退描述后续句）+ 分类/领域/类型 + 附带文档，**不展示 SKILL.md 原文**，详情字段随列表一次下发、点击不再请求接口 |
 
 - 默认开关全 False，Agent 只保留知识检索/时间/通知基础工具
 - **用户自建技能（复刻 DeerFlow skill-creator）**：`skill_manage` 工具（受 `ai:agent` 门控）让用户对话创建/查看/修改技能，按用户隔离存 `skills/users/<uid>/<name>/`（公开技能在 `skills/<name>/`）；技能名全局唯一，写盘过静态+LLM 语义安全扫描（`AGENT_SKILL_LLM_SCAN`，fail-closed）。`skill_creator` 技能引导访谈→起草→创建。热加载：写盘后 `bump_skills_version()` → 下一条消息触发 agent 重建。用户技能不进 `<available-tools>`/路由词汇表，按需 tool_search 命中。**部署注意：`skills/users/` 是运行期写入，Docker 需挂 volume，否则容器重建丢技能**
@@ -295,7 +308,7 @@ LLM 需要做全量/统计/聚合/报告时，数据先物化到沙箱（原始�
   `event: complete`，不引 `gradio_client`；**Gradio 6 起文件入参须是带 `meta._type` 的 `FileData`
   对象，裸路径被拒**），结果表 `{headers:["文件名","Prediction","sharp","borderline","defocused","错误"]}`
   按**表头名**定位列（无表头才回退旧位置），按文件名（同名按位置）映射回设备；概率列是带 `%`
-  的字符串（未校准 softmax），「模型分数」取预测类别那一列的原值。**检测单位是用户勾选的
+  的字符串（未校准 softmax），「置信度」取预测类别那一列的原值。**检测单位是用户勾选的
   巡检任务**（每月只更新部分任务，查过的不重复查）：mgmt `/infrared/inspection/task/list|detail/v1/…`
   取任务与设备，`picture` 是 7 天预签名 URL → **检测时顺手把图留在本地**
   （`INFRARED_QUALITY_IMAGE_DIR/{task_id}/{设备id}{ext}`；**缓存命中的设备也补图**，本地已有则跳过 →
@@ -320,13 +333,119 @@ LLM 需要做全量/统计/聚合/报告时，数据先物化到沙箱（原始�
   `GET .../image`。本机 dry-run
   `python -m service.infrared_quality.cli --dept A1 --company 廊坊`、单图复测 `--predict <file>`、
   自检 `python -m service.infrared_quality.tests.test_infrared_quality`（24 项）。详见 `docs/features/infrared-quality-check.md`
+- **应急演练记录合规审查（`DRILL_AUDIT_ENABLED`，默认关）** — `service/drill_audit/` +
+  `tools/drill_audit_tools.py::drill_compliance_audit` + `skills/drill_audit/SKILL.md`。
+  定位演练周 → 下载 A/B/C/D 四份班组记录 PDF（**只能用** `GET /drill/plan/download/v1/{file_id}`；
+  `POST /file/v1/download` 返 `data:null`、预签名对象不存在）→ MinerU OCR（`DRILL_AUDIT_LOCAL_OCR`
+  默认 true 且配了 `MINERU_GRADIO_URL` 时走本地 Gradio `_load_pdf_mineru_gradio(..., is_ocr=True)`
+  （vlm-engine，实测 8~10s），异常回退云端 `_load_pdf_mineru_api(path, is_ocr=True, language='ch')`；
+  扫描件 `extract_text()` 为 0 字符，**不能**调 `_load_pdf_uncached`——本地 CLI 兜底挂 600s）→ 检索知识库 EOP
+  （`intent_filter={'doc_type':'EOP'}` 后再按 `doc_type=='EOP'` 过滤，每周一次共享）→
+  **每个班组各自独立一次 LLM 比对**（`judge.audit_group`，只喂本班组记录、不截断 + 压缩时间轴，并发
+  `DRILL_AUDIT_JUDGE_CONCURRENCY`；输出解析不出有效结论时放宽 `max_tokens` 3000→6000
+  重试一次，仍失败才 fail-open）→ 周级统计与各组一句话确定性拼接 →
+  `{groups[letter,status,issue_count,severity_counts,summary,error,flow?,dimensions,missing_steps,step_findings,timeline_stats], issues[group,dimension,seq?,eop_basis,drill_evidence,…], summary, note}`
+  （`pipeline.week_summary` 零额外 LLM 调用）。**按维度判、重点查漏**：以 EOP 为唯一标尺，
+  `eop_spec.extract_steps` 把 §9.3 拆成可勾对清单，逐条在时间轴里**语义匹配**——EOP 有、演练没做的
+  即「漏做」进 `missing_steps` 并镜像进 issues（`dimension=step_completeness`）；5 个有序维度
+  （岗位分配/步骤完整性/时限执行/操作合规/关键项）各给 `达标|偏差|缺失|无法判定`，服务端归一化
+  （缺键补无法判定、偏差/缺失无 EOP 依据降级、executor/time_limit 从清单回填、step_findings 的
+  actual 按 metric 服务端覆盖）。**不做「合规 / 不合规」档位判定**：只给每组综合评价、
+  问题清单与按严重程度（高/中/低）的统计，个别小问题不等于整周不合格。**原始 OCR 文本不进上下文**，
+  但 PDF 与 OCR 文本落本地内容库（`data/drill_audit/sha256/…`，内容哈希、原子写、按容量 LRU 淘汰：
+  先删 PDF 保文本、不设期限），Mongo 只存索引 `drill_audit_files` 与周记录 `drill_audit_weeks`；
+  **命中则零下载零 OCR**，`refresh=true` 绕过读取。无 EOP / 检索不可用 → 各有文本班组只说明「无法评价」+ 原因
+  且不调模型（Milvus 连不上抛 `EopRetrievalError`，`note` 写「知识库检索不可用」，与「无相关 EOP」区分）；
+  单份 OCR 失败 / 缺文件 → 该组 `groups[]` 行 `status=ocr_failed|missing` 并带原因，其余班组照判。
+  **附件**（`deliver.build_attachments`，每项独立兜底）：问题明细交互表（≤20 条另带服务端文字表）、
+  演练过程记录 Markdown（`process.py` 把 OCR 文本整理成场景 / 人员分配 /
+  演练过程时间轴 + Mermaid 泳道并行流程图（每条泳道一竖列、泳道间隐形连线 `~~~`、
+  不画跨泳道可见连线），
+  每步一节点不漏、泳道取自人员分配班组，
+  `workspace/drill-records-*.md`，**不再转贴 OCR 表格、不暴露原始扫描 PDF**），
+  均由服务端渲染，模型只原样输出 `file_tag`/`table_markdown`。
+  **流程图同时随 `groups[].flow` 下发**（`build_flows`/`attach_flows`，与附件同源同函数、
+  挂载在 `save_week` 之后不写库），由模型原样贴在回答里、前端本地渲染 —— 用户不用开附件
+  就能看到演练过程；时间轴文字仍只在附件。飞书/微信 `channels/file_tags.py` 会剥离
+  ```mermaid 围栏块。
+  检索命中的 EOP 文档清单不落附件，仅以 `eop_refs` 随返回下发供口头说明。
+  `_pick_week` 缺省优先已完成/有记录的已安排周，计划名子串 0/多命中报错回候选。本机核对
+  `python -m service.drill_audit.cli --dept 23CI1EiZnff --year 2026 --plan-name 制冷`（dry-run，
+  `--yes` 才下载+OCR+判定）、自检 `python -m service.drill_audit.tests.test_drill_audit`（29 项）+
+  `...tests.test_store`（5 项）+ `...tests.test_weekly`（9 项）。
+  **每周任务与页面**：`DRILL_AUDIT_WEEKLY_ENABLED`（需同时 `DRILL_AUDIT_ENABLED=true`，默认关）
+  每周一 07:10（`DRILL_AUDIT_WEEKLY_CRON`）扫「到点该审」的已安排周（`status=0` + 有记录 +
+  `etime` 落在 `DRILL_AUDIT_WEEKLY_LOOKBACK_DAYS`=14 窗口，部门清单空则复用 `DOC_UPDATE_DEPTS`），
+  逐周 `run_audit(audit_source='weekly')` 落同一份 `drill_audit_weeks`（幂等：已审日期 ≥ etime 当天
+  且无 `ocr_failed/missing` 组 → 跳过），预设 `drill_audit__weekly` 独立一族、不产附件。合规检查页第五张卡
+  （`DrillAuditPanel`）+ 整屏看板（`DrillAuditBoard`：**「任务 × 周」矩阵表格**——行 = 序号 + 计划名，
+  **任务列 sticky、紧跟一列「专业」（不 sticky）、部门不在表内显示**，列 = 周（按月份分组表头），
+  筛选条含年份/月份/部门/专业（年份与月份收窄列、专业只过滤行），单元格按上游 `finishStatus`
+  （1 未开始 / 2 进行中 / 3 已完成 / 4 已逾期）展示执行状态：已审 = 该周高/中/低问题 chips（全 0 绿色「无问题」）；
+  未审且 `fileStatus` 非空（已交记录）且非未开始/进行中 = 「已完成/已逾期 · 待审查」只展示橙色状态 chip，
+  **整格不直接可点**（避免误触直接跑一次下载+OCR+判定的重流程；格内也不放「执行」按钮），单周审查改由
+  「批量执行」勾选 1 个后执行
+  （`POST .../run` body `items` 非空 → `weekly.run_selected_weeks`，`audit_source='manual'`）；未交记录 = 灰色
+  状态 chip 不可点；无排期「—」。筛选条「批量执行」进入多选态勾选多周 →「执行选中 N 项」只跑勾选的周；
+  原「立即检查」已改为**「刷新清单」**（只重拉计划，不触发全量审查；全量 `run_weekly_audit` 仅留给每周一定时任务/脚本），
+  详情态头部另有「重新审查」单周重跑；点已审格进单周详情：整体情况 + 班组胶囊切换（一次看一个班组的场景/人员分配/流程图/步骤/该组问题）；
+  对话记录与每周记录都显示并标来源；`plan_rows` 每行带 `weeks[{key, week_id, finish_status, file_status}]`，
+  旧缓存缺 `week_id` 时前端自动触发一次 roster 刷新）。端点
+  `GET /scheduled-tasks/drill-audit/overview`、`POST .../run`、`POST .../roster`（只刷新计划清单，
+  `LeaderLock('drill_audit:roster')`）、`GET .../weeks/{week_id}`
+  （详情读时用内容库 OCR 文本重算流程图与步骤，不落 Mongo；文本被淘汰则 `steps_available=false`）。
+  详见 `docs/features/drill-audit.md`
+- **日常变更统计（`CHANGE_NOTICE_ENABLED`，默认关）** — `service/scheduled_task/change_notice/`，
+  页面 `/ops/change-notice`（入口「AI 能力 → 日常运维」`/ops` 卡片落地页；事件统计页 `/ops/incident-stats`
+  同在同一落地页，原从合规页移出），
+  对话工具 `tools/change_notice_tools.py::change_notice_report`，定时预设 `change_notice__all__daily`
+  （cron 读 `CHANGE_NOTICE_CRON`，默认 `10 18 * * *`，统计当天 00:00 ~ 运行时刻）。数据源是 6 个园区「日常运维工作」群
+  的每日变更通知（**独立表 PG `dcim_change_reports`**，与应急通报表 `dcim_incident_reports`
+  物理分开；入口按群身份路由，变更群消息不参与告警匹配、不进事件统计）：**只统计人发的**
+  （`sender_id_type=='open_id'`，机器人卡片 `app_id` 不看），园区↔群映射放独立的
+  `CHANGE_NOTICE_FEISHU_PARK_CHATS`（**不能并进 `INCIDENT_FEISHU_PARK_CHATS`**）。
+  `incident_stats/feishu.py` 的 `classify(text, chat_id)` **先按群身份**判：日常群只产出
+  `change`/`other`、**绝不产出 `sos`/`first`**；事件表与告警匹配只取 `kind IN ('sos','first')`。
+  实测四种报文形态，**纳入三种**（`parse._ENABLED_FORMATS`）：廊坊竖线 `标签：值`（lf）、
+  佛山/重庆 `【变更开始-<标题>】`+`【变更单号】`（bracket）与平湖 `维护通告`+编号列表（ph，无工单号）；
+  ph 的「位置」是楼宇字母，按 `parse._DC_ALIASES` 映射数据中心（**Y楼→A1、Z楼→A2、W/W楼→M3M4**）。
+  惠州 `【维修变更开始/完成】`（无计划时间）不算正常变更、直接丢弃（解析代码保留可回退）。
+  ph 与 lf **不是重复、不做跨格式去重**（用户口径），同事件双发时各自成行。
+  自然日口径（按消息 `create_time` 归属），配对键 `(园区,工单号)`；无工单号回退
+  `(园区,数据中心,标题,日期)`（ph 路径）。**一个工单可对应多次变更**（2026-11-24 A18 实测），
+  同键内再按变更窗口（计划开始，缺失用实际开始，归一到分钟）分条：窗口相同的重发才合并，
+  完成通知先配同窗口、配不上并入最近一条未完成；合并取最早时间/最高状态。变更类型由变更等级
+  分桶、无依据即「未标注」。0 行不算失败（照出空表 + SUCCESS）。
+  **现场负责人等级**（`people.py`，2026-11-20）取自综合管理平台人员档案（报文本身无职级）：
+  先 `/user/info/v2/{姓名}` 拿 uid/deptId、再 `/user/dept/v4/page` 取 `users[].level`（**不用**
+  `professionLevel`，实测口径不一致）；在 `collect_events` 配对去重后补、按姓名缓存（命中 7 天），
+  重名冲突按园区匹配部门名、仍分不出留空，接口失败/超时一律留空（fail-open）；档案确有此人但无等级
+  写「无评级」，否则空串。明细 14 列（`现场负责人` 后加 `现场负责人等级`；报文原等级列显示为「变更等级」，
+  已去掉「来源格式」列）。**等级匹配（页面，2026-11-20）**：`build.match_of` 逐级核对
+  （低风险→初级及以上、中风险→中级及以上、高风险/紧急→高级、未标注→无法判定），多人取最高职级、
+  无等级/「无评级」→ 无法判定；`overview()` 每园区多给 `by_match`，records 端点 `to_rows(with_match=True)`
+  补隐藏键 `__match`（**不进 COLUMNS**，对话与 xlsx 仍 14 列）。页面已重做（Hero 总览 + 三张分布卡 +
+  胶囊标签 + 匹配行色条 + 空状态）。
+  **字段抽取兜底**：未登记但带语义提示词的标签记为 `unknown`（不再污染上一条字段），调模型从原文抽
+  （只填空字段、时间过区间校验），`CHANGE_NOTICE_EXTRACT_LLM_ENABLED`/`_MAX_PER_ROUND`/`_TIMEOUT`；四入口统一
+  走 `workflow.collect_events()`。**负责人两档、只留姓名**（2026-11-23）：负责人性质标签
+  （现场负责人/变更负责人/相关负责人/现场联系人/人员）优先、值班工程师/值班人员兜底，剥电话/工号；
+  调模型闸放宽为「`unknown` 非空 **或** 有负责人标签却没解析出姓名」。
+  边界：人从 2026-11-19 才按新流程发，更早日期为空；惠州（维修格式）恒 0、佛山起点后暂无
+  方括号报文（历史 8 条在 11-17 前）、巴淡/平湖D 单量少或群未配置。详见 `docs/features/daily-change-notice.md`
+  **变更通知合规周报 PDF**（分析报告 · `changenotice__nationwide__weekly`）：同源取数出可下载 PDF，
+  走 `change_notice/weekly_report.py`（`runner` 按 `changenotice__` 前缀早分支；类型 id 无下划线，与
+  `change_notice__` 族互不吞并）。合规判定是可扩展规则表 `compliance.RULES`（加规则只追加一项）：① 发送
+  晚于计划开始 ② 当日未发开始 ③ 完成通知时间与实际完成不符（阈值
+  `CHANGE_COMPLIANCE_COMPLETION_DIFF_MINUTES` 默认 30 分钟）；缺数据判「无法判定」不臆造。判定依赖
+  `build._merge` 内部键 `has_start`/`start_msg_time`/`has_end`/`end_msg_time`（不进输出列）。
 - skills — 纯本地文档能力（`skills/` 目录），无外部 API 依赖；用户自建技能运行期写入 `skills/users/`
 - Coze Studio — 独立 Go 服务，后台 API 代理调用 (配置了但 `service/coze_proxy/` 未实现)
 - LLM — OpenAI 兼容 API，视觉模型默认 `qwen3.5-vl`，对话模型默认 `qwen3.5`
 - Milvus — 向量数据库，default: `http://localhost:19530`
 - MongoDB — `rz_ai_platform` database，存储 users/roles/applications/audit_logs/video_tasks/feedbacks
 - Redis — Session/Token 黑名单/缓存/调度器，prefix `rz:`
-- MinerU — PDF 解析服务 (mineru.net API)，`MINERU_ENABLED=true` 时启用
+- MinerU — PDF 解析服务，`MINERU_ENABLED=true` 时启用；配 `MINERU_GRADIO_URL`（现场 Gradio 服务）优先走本地，云端 mineru.net v4 兜底
 
 ### 已知未完成模块
 
@@ -337,9 +456,9 @@ LLM 需要做全量/统计/聚合/报告时，数据先物化到沙箱（原始�
 
 React + TypeScript + Vite + Tailwind CSS 4 + shadcn/ui。入口 `ChatPage.tsx`，`platform-shell.tsx` 侧边栏展示功能入口（知识库/隐患检测/消防配置/视频生成/权限中心/Agent）。
 
-**页面：** `LoginPage`, `ChatPage` (RAG 对话 + Agent 智能体), `KnowledgePage` (知识库管理), `RiskPage` (隐患检测), `FireSafetyPage` (消防配置), `VideoPage` (视频生成), `PermissionPage` (权限申请/审批), `OverviewPage` (仪表盘), `InnovationPage` (创新工坊), `SettingsPage` (设置), `admin/` (管理后台)
+**页面：** `LoginPage`, `ChatPage` (RAG 对话 + Agent 智能体), `KnowledgePage` (知识库管理), `RiskPage` (隐患检测), `FireSafetyPage` (消防配置), `VideoPage` (视频生成), `CompliancePage` (不合规检查), `OpsPage` (日常运维卡片落地页), `ChangeNoticePage` (日常运维 — 变更统计), `IncidentStatsPage` (日常运维 — 事件统计), `PermissionPage` (权限申请/审批), `OverviewPage` (仪表盘), `InnovationPage` (创新工坊), `SettingsPage` (设置), `admin/` (管理后台)
 
-**Agent 相关组件：** `ChatArea.tsx` (SSE 对话流 + 工具卡片渲染 + 右侧看板面板), `ChatInput.tsx`, `ChartRenderer.tsx` (Agent `<chart>` 标签 26 种图表本地渲染), `MermaidRenderer.tsx` (`<mermaid>` 标签), `FileCard.tsx` (沙箱产物下载卡片，`.html` 加「在看板中查看」), `ArtifactPanel.tsx` (右侧 HTML 看板面板), `HtmlPreview.tsx` (sandbox iframe 预览，echarts 打包内联)
+**Agent 相关组件：** `ChatArea.tsx` (SSE 对话流 + 右侧看板面板；工具调用 + 中间旁白折叠为气泡内的「处理过程」时间线，助手/用户均为头像 + 名字 + 气泡，正文只留最终答案；工具详情逐字段复制（分析类工具的参数代码按语言着色，见 `CodeHighlight.tsx`）；上翻时暂停自动跟随并浮「回到底部」；思考态为三点跳动 +「正在思考…」), `ChatInput.tsx` (Enter 发送，输入法组合态回车不误发), `MarkdownContent.tsx` (统一 Markdown 渲染，代码块 `rehype-highlight` 语法高亮), `ChartRenderer.tsx` (Agent `<chart>` 标签 26 种图表本地渲染), `MermaidRenderer.tsx` (`<mermaid>` 标签), `FileCard.tsx` (沙箱产物下载卡片，`.html` 加「在看板中查看」), `ArtifactPanel.tsx` (右侧 HTML 看板面板), `HtmlPreview.tsx` (sandbox iframe 预览，echarts 打包内联)
 
 **状态管理：** Zustand — `authStore`, `chatStore`, `appStore`, `videoStore`
 

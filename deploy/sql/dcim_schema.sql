@@ -344,6 +344,29 @@ CREATE INDEX IF NOT EXISTS idx_dcim_incident_reports_event
 CREATE INDEX IF NOT EXISTS idx_dcim_incident_reports_kind
   ON dcim_incident_reports (kind, create_time);
 
+-- ============ 日常运维群变更消息表（2026-11-19） ============
+-- 与应急通报表**物理分开**：入口（incident_stats/realtime.py）按群身份路由，
+-- 变更群的消息只落本表，不参与告警匹配、不进事件统计。不存 cluster/event_time/
+-- match_* 等应急专用列。写入方：service/scheduled_task/change_notice/，
+-- 同一份 DDL 也在 incident_stats/schema.py 的 ensure_change_schema 里幂等执行。
+CREATE TABLE IF NOT EXISTS dcim_change_reports (
+  id             BIGSERIAL PRIMARY KEY,
+  chat_id        TEXT NOT NULL,
+  message_id     TEXT NOT NULL,
+  kind           TEXT NOT NULL,      -- change(变更通知) | other
+  title          TEXT,
+  create_time    BIGINT NOT NULL,    -- 消息时间（秒级 epoch）
+  text           TEXT,
+  raw            JSONB,
+  sender         TEXT,
+  sender_id      TEXT,
+  sender_id_type TEXT,
+  ingested_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dcim_change_reports_chat
+  ON dcim_change_reports (chat_id, create_time);
+
 -- ============ 常用查询示例（均按园区隔离） ============
 -- 空间树（递归 CTE）：
 --   WITH RECURSIVE t AS (

@@ -8,7 +8,7 @@
 2. 通断类 `maxUse=1, maxAlarm=0` 是真上限（判据看 `maxUse`，不看 `maxAlarm`）；
 3. 四档全输出；越限档可多档、按重 → 轻；
 4. **每次发生各查一次**（同类 3 次发生 → 3 次点查；代表单先搜），且按**触发态时间**
-   （秒级）查 `find_alarms_by_trigger_time`；
+   查 `find_alarms_by_trigger_time`，**起止都等于发生时间**（精确同秒，不设容差窗口）；
 5. 代表单取 `ticketNo`，缺票号退回同类最早发生时间；
 6. 单候选直接接受、不调 picker；多候选走 picker；
 7. picker 返回 null / 抛异常 → 未匹配（留空不配错）；
@@ -95,7 +95,7 @@ class _Repo:
     self.closed = False
 
   def find_alarms_by_trigger_time(self, clusters, start_s, end_s, limit=200):
-    """±2 分钟候选（**秒级**，触发态时间）。"""
+    """精确同秒候选（**秒级**，触发态时间）。"""
     self.calls += 1
     self.clusters.append(list(clusters or []))
     self.trigger_queries.append((list(clusters or []), start_s, end_s))
@@ -231,7 +231,7 @@ def test_thresholds_resolved_via_composed_point_key():
     'important_alarm': {'maxUse': 1, 'maxAlarm': 30, 'minUse': 0, 'minAlarm': 0},
     'urgent_alarm': {'maxUse': 0, 'maxAlarm': 0, 'minUse': 0, 'minAlarm': 0},
   }}
-  repo = _Repo([_alarm('G1', '2026-11-02 14:03:30')],
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:00')],
                trigger={('A', 'G1'): 11.0}, points=points)
   out = _run(stats, recs, repo=repo)
   alarm = out['clusters'][0]['alarms'][0]
@@ -249,10 +249,10 @@ def test_one_query_per_occurrence():
           _rec('T2', '市电中断', '2026-11-02 14:33:00'),
           _rec('T3', '市电中断', '2026-11-02 15:03:00'),
           _rec('T4', '空调停机', '2026-11-02 16:03:00')]
-  alarms = [_alarm('G1', '2026-11-02 14:03:30'),
-            _alarm('G2', '2026-11-02 14:33:30', point_guid='P2', value=13.5),
-            _alarm('G3', '2026-11-02 15:03:30', point_guid='P3', value=14.5),
-            _alarm('G4', '2026-11-02 16:03:30')]
+  alarms = [_alarm('G1', '2026-11-02 14:03:00'),
+            _alarm('G2', '2026-11-02 14:33:00', point_guid='P2', value=13.5),
+            _alarm('G3', '2026-11-02 15:03:00', point_guid='P3', value=14.5),
+            _alarm('G4', '2026-11-02 16:03:00')]
   stats = _stats([{'name': '市电中断', 'count': 3, 'ticketNo': 'T1'},
                   {'name': '空调停机', 'count': 1, 'ticketNo': 'T4'}])
   repo = _Repo(alarms)
@@ -262,7 +262,7 @@ def test_one_query_per_occurrence():
   assert cluster['total'] == 3 and cluster['matched_n'] == 3, cluster
   assert [a['time'] for a in cluster['alarms']] == [
     alarm_link._fmt_time(_ts(t)) for t in
-    ('2026-11-02 14:03:30', '2026-11-02 14:33:30', '2026-11-02 15:03:30')], cluster
+    ('2026-11-02 14:03:00', '2026-11-02 14:33:00', '2026-11-02 15:03:00')], cluster
   assert [a['value'] for a in cluster['alarms']] == [12.5, 13.5, 14.5], cluster
   assert out['linked_n'] == 2 and out['available'] is True, out
   assert repo.closed is True
@@ -273,7 +273,7 @@ def test_representative_falls_back_to_earliest():
   recs = [_rec('T2', '市电中断', '2026-11-02 14:10:00'),
           _rec('T1', '市电中断', '2026-11-02 14:03:00')]
   stats = _stats([{'name': '市电中断', 'count': 2}])
-  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]))
+  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]))
   occ = out['clusters'][0]['occurrence']
   assert occ['ticketNo'] == 'T1', occ
   assert occ['occurred_at'] == alarm_link._fmt_time(_ts('2026-11-02 14:03:00')), occ
@@ -284,7 +284,7 @@ def test_single_candidate_skips_picker():
   picker = _Picker()
   stats = _stats([{'name': '市电中断', 'count': 4, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00')]
-  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:30')]),
+  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
              picker=picker)
   assert picker.calls == [], picker.calls
   cluster = out['clusters'][0]
@@ -294,8 +294,8 @@ def test_single_candidate_skips_picker():
 def _multi_setup():
   stats = _stats([{'name': '市电中断', 'count': 4, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00')]
-  alarms = [_alarm('G1', '2026-11-02 14:03:10', device='UPS-01'),
-            _alarm('G2', '2026-11-02 14:04:00', device='UPS-02', point_guid='P2')]
+  alarms = [_alarm('G1', '2026-11-02 14:03:00', device='UPS-01'),
+            _alarm('G2', '2026-11-02 14:03:00', device='UPS-02', point_guid='P2')]
   return stats, recs, _Repo(alarms)
 
 
@@ -316,17 +316,17 @@ def test_signature_prior_skips_picker_for_other_occurrences():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00'),
           _rec('T2', '市电中断', '2026-11-02 14:10:00')]
-  alarms = [_alarm('G1', '2026-11-02 14:03:10', point_guid='P1', device='UPS-P1'),
-            _alarm('G2', '2026-11-02 14:03:20', point_guid='P2', device='UPS-P2'),
-            _alarm('G3', '2026-11-02 14:10:05', point_guid='P1', device='UPS-P1'),
-            _alarm('G4', '2026-11-02 14:10:15', point_guid='P2', device='UPS-P2')]
+  alarms = [_alarm('G1', '2026-11-02 14:03:00', point_guid='P1', device='UPS-P1'),
+            _alarm('G2', '2026-11-02 14:03:00', point_guid='P2', device='UPS-P2'),
+            _alarm('G3', '2026-11-02 14:10:00', point_guid='P1', device='UPS-P1'),
+            _alarm('G4', '2026-11-02 14:10:00', point_guid='P2', device='UPS-P2')]
   picker = _Picker((2, '第二条'))     # 代表单：排第 2 的 P2
   out = _run(stats, recs, repo=_Repo(alarms), picker=picker)
   assert len(picker.calls) == 1, picker.calls
   cluster = out['clusters'][0]
   assert [a['device'] for a in cluster['alarms']] == ['UPS-P2', 'UPS-P2'], cluster
   assert [a['ts'] for a in cluster['alarms']] == [
-    _ts('2026-11-02 14:03:20'), _ts('2026-11-02 14:10:15')], cluster
+    _ts('2026-11-02 14:03:00'), _ts('2026-11-02 14:10:00')], cluster
   assert [v['match'] for v in cluster['occurrences']] == ['llm', 'point'], cluster
   assert cluster['matched_n'] == 2 and out['llm_calls'] == 1, (cluster, out)
 
@@ -345,9 +345,9 @@ def test_picker_null_or_error_is_unmatched():
 def test_room_code_narrowing():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00', dc='A1分部')]
-  alarms = [_alarm('G1', '2026-11-02 14:03:10',
+  alarms = [_alarm('G1', '2026-11-02 14:03:00',
                    space='廊坊园区A1数据中心A1模组1F-PDU房'),
-            _alarm('G2', '2026-11-02 14:03:40', point_guid='P2',
+            _alarm('G2', '2026-11-02 14:03:00', point_guid='P2',
                    space='廊坊园区B1M2数据中心B1M2模组2F-PDU房')]
   picker = _Picker((1, 'ok'))
   out = _run(stats, recs, repo=_Repo(alarms), picker=picker)
@@ -367,10 +367,10 @@ def test_room_code_narrowing():
 def test_each_ambiguous_category_arbitrated():
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00'),
           _rec('T2', '空调停机', '2026-11-02 15:03:00')]
-  alarms = [_alarm('G1', '2026-11-02 14:03:10'),
-            _alarm('G2', '2026-11-02 14:03:50', point_guid='P2'),
-            _alarm('G3', '2026-11-02 15:03:10'),
-            _alarm('G4', '2026-11-02 15:03:50', point_guid='P2')]
+  alarms = [_alarm('G1', '2026-11-02 14:03:00'),
+            _alarm('G2', '2026-11-02 14:03:00', point_guid='P2'),
+            _alarm('G3', '2026-11-02 15:03:00'),
+            _alarm('G4', '2026-11-02 15:03:00', point_guid='P2')]
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'},
                   {'name': '空调停机', 'count': 2, 'ticketNo': 'T2'}])
   picker = _Picker((1, 'ok'))
@@ -393,7 +393,7 @@ def test_sort_alarms():
 def test_non_langfang_not_queried():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00', park='平湖园区B1数据中心')]
-  repo = _Repo([_alarm('G1', '2026-11-02 14:03:10')])
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:00')])
   out = _run(stats, recs, repo=repo)
   assert repo.calls == 0, repo.calls
   cluster = out['clusters'][0]
@@ -405,14 +405,31 @@ def test_non_langfang_not_queried():
 def test_query_uses_park_prefixed_clusters():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00', dc='B1M2分部')]
-  repo = _Repo([_alarm('G1', '2026-11-02 14:03:10', cluster='廊坊B1M2')])
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:00', cluster='廊坊B1M2')])
   out = _run(stats, recs, repo=repo)
   ts = _ts('2026-11-02 14:03:00')
   assert repo.clusters == [['廊坊A', '廊坊B1M1', '廊坊B1M2']], repo.clusters
-  # 按**触发态时间**、**秒级**窗口查（±120s）
+  # 按**触发态时间**、**精确同秒**查（起止都等于发生时间）
   assert repo.trigger_queries == [(['廊坊A', '廊坊B1M1', '廊坊B1M2'],
-                                   ts - 120, ts + 120)], repo.trigger_queries
+                                   ts, ts)], repo.trigger_queries
   assert out['linked_n'] == 1, out
+
+
+# ── 15b. 相差 1 秒不算（精确同秒，无容差窗口） ──
+def test_one_second_offset_is_not_matched():
+  stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
+  recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00')]
+  picker = _Picker((1, 'ok'))
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:01')])
+  out = _run(stats, recs, repo=repo, picker=picker)
+  ts = _ts('2026-11-02 14:03:00')
+  assert repo.trigger_queries == [(['廊坊A', '廊坊B1M1', '廊坊B1M2'], ts, ts)], repo.trigger_queries
+  assert picker.calls == [], picker.calls
+  cluster = out['clusters'][0]
+  assert cluster['alarms'] == [], cluster
+  assert cluster['occurrence']['status'] == 'no_alarm', cluster['occurrence']
+  assert '那一秒' in cluster['occurrence']['reason'], cluster['occurrence']
+  assert out['linked_n'] == 0, out
 
 
 # ── 16. 全国口径：法人主体 → gardenName 判园区 ──
@@ -425,7 +442,7 @@ def _nationwide_rec(company, when='2026-11-02 14:03:00', dc='A1分部'):
 def test_nationwide_langfang_entity_is_queried():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_nationwide_rec('润泽科技发展有限公司')]
-  repo = _Repo([_alarm('G1', '2026-11-02 14:03:10')])
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:00')])
   out = _run(stats, recs, repo=repo,
              company_parks={'润泽科技发展有限公司': '廊坊园区'})
   assert repo.calls == 1 and out['linked_n'] == 1, (repo.calls, out)
@@ -434,7 +451,7 @@ def test_nationwide_langfang_entity_is_queried():
 def test_nationwide_other_entity_not_queried():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_nationwide_rec('广东润惠科技发展有限公司')]
-  repo = _Repo([_alarm('G1', '2026-11-02 14:03:10')])
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:00')])
   out = _run(stats, recs, repo=repo,
              company_parks={'广东润惠科技发展有限公司': '佛山园区'})
   assert repo.calls == 0, repo.calls
@@ -457,19 +474,19 @@ def test_nationwide_room_code_fallback_and_ambiguous():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   # 档案不可用，但部门带 B1M2 → 仍可判定为廊坊
   recs = [_nationwide_rec('润泽科技发展有限公司', dc='B1M2分部')]
-  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]),
+  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
              company_parks={})
   assert out['linked_n'] == 1, out
 
   # A18 是跨园区歧义码（廊坊 / 佛山都有 A 栋），不猜
   recs2 = [_nationwide_rec('广东润惠科技发展有限公司', dc='A18分部')]
-  out2 = _run(stats, recs2, repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]),
+  out2 = _run(stats, recs2, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
               company_parks={})
   assert out2['linked_n'] == 0 and '非廊坊' in out2['clusters'][0]['occurrence']['reason']
 
   # 既无法人主体、部门也没有集群代号 → 无法判断
   rec3 = _rec('T1', '市电中断', '2026-11-02 14:03:00', park=None, dc='弱电部')
-  out3 = _run(stats, [rec3], repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]),
+  out3 = _run(stats, [rec3], repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
               company_parks={})
   assert out3['linked_n'] == 0 and '无法确定' in out3['clusters'][0]['occurrence']['reason']
 
@@ -478,7 +495,7 @@ def test_nationwide_room_code_fallback_and_ambiguous():
 def test_explicit_park_overrides_company_name():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_nationwide_rec('润泽科技发展有限公司')]
-  repo = _Repo([_alarm('G1', '2026-11-02 14:03:10')])
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:00')])
   out = _run(stats, recs, park='廊坊', repo=repo)   # company_parks 空也不影响
   assert repo.calls == 1 and out['linked_n'] == 1, (repo.calls, out)
 
@@ -542,7 +559,11 @@ def test_render_all_alarms_and_occurrence_note():
 
   empty = {'available': True, 'note': _NOTE, 'clusters': [
     {'name': 'x', 'count': 1, 'occurrence': {}, 'alarms': []}]}
-  assert '未关联到 DCIM 告警' in render._alarm_link_block(empty)
+  empty_html = render._alarm_link_block(empty)
+  assert '未关联到 DCIM 告警' in empty_html
+  # 覆盖范围免责句不再进报告（note 仍保留在 payload 里，只供对话工具）
+  assert '未关联到告警不等于' not in empty_html, empty_html
+  assert '未关联到告警不等于' not in html, html
 
 
 # ── 19. 判定表 ──
@@ -554,7 +575,7 @@ def test_decision_hit_skips_query_and_picker():
   stats = _stats([{'name': '市电中断', 'count': 5, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00')]
   store = _Store()
-  first = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]),
+  first = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
                store=store)
   assert first['linked_n'] == 1, first
   # 第二轮：判定表命中 → 不查时间窗、不调仲裁
@@ -571,7 +592,7 @@ def test_decision_miss_writes_back():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00', dc='A1分部')]
   store = _Store()
-  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]),
+  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
              store=store)
   assert len(store.saved) == 1, store.saved
   doc = store.saved[0]
@@ -580,7 +601,7 @@ def test_decision_miss_writes_back():
   assert doc['status'] == 'matched' and doc['match'] == 'time', doc
   assert doc['alarm'] == {'cluster': 'A', 'event_log_id': 'G1'}, doc
   assert doc['point_sig'] == ['A', 'd1', 'P1'], doc
-  assert doc['alarm_ts'] == _ts('2026-11-02 14:03:10'), doc
+  assert doc['alarm_ts'] == _ts('2026-11-02 14:03:00'), doc
   assert doc['alarm_snapshot']['device'] == 'UPS-01', doc
   assert doc['rule_version'] == alarm_decision.RULE_VERSION, doc
   assert out['clusters'][0]['alarms'], out
@@ -599,7 +620,7 @@ def test_decision_scope_is_part_of_key():
   assert store.saved[0]['status'] == 'not_covered', store.saved
   # 换园区口径 → 新键、不命中全国口径的「非廊坊」结论
   local = _Store()
-  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]),
+  out = _run(stats, recs, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
              park='廊坊', store=local)
   assert out['cache_hits'] == 0 and out['linked_n'] == 1, out
   assert local.loaded[0] == alarm_decision.decision_id('T1', ts, '廊坊'), local.loaded
@@ -608,7 +629,7 @@ def test_decision_scope_is_part_of_key():
 def test_decision_store_fail_open():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs = [_rec('T1', '市电中断', '2026-11-02 14:03:00')]
-  alarms = [_alarm('G1', '2026-11-02 14:03:10')]
+  alarms = [_alarm('G1', '2026-11-02 14:03:00')]
 
   load_fail = _Store(fail_load=True)
   repo = _Repo(alarms)
@@ -631,7 +652,7 @@ def test_decision_force_refresh_overrides():
     status='matched', name='市电中断', match='llm',
     alarm={'cluster': 'A', 'event_log_id': 'G-OLD'})
   store = _Store({stale['_id']: stale})
-  repo = _Repo([_alarm('G1', '2026-11-02 14:03:10')])
+  repo = _Repo([_alarm('G1', '2026-11-02 14:03:00')])
   out = _run(stats, recs, repo=repo, store=store, force_refresh=True)
   assert store.loaded == [], store.loaded
   assert repo.calls == 1 and out['cache_hits'] == 0, (repo.calls, out)
@@ -650,7 +671,7 @@ def test_transient_failure_not_stored():
   no_park = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   recs2 = [_rec('T1', '市电中断', '2026-11-02 14:03:00', park=None, dc='弱电部')]
   store2 = _Store()
-  out2 = _run(no_park, recs2, repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]),
+  out2 = _run(no_park, recs2, repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]),
               store=store2, company_parks={})
   assert '无法确定' in out2['clusters'][0]['occurrence']['reason'], out2
   assert store2.saved == [], store2.saved
@@ -671,7 +692,7 @@ def test_company_registry_unavailable_not_stored():
     with _gate():
       out = asyncio.run(alarm_link.link_repeat_alarms(
         stats, recs, {}, _WIN, repo_factory=lambda: _Repo(
-          [_alarm('G1', '2026-11-02 14:03:10')]),
+          [_alarm('G1', '2026-11-02 14:03:00')]),
         picker=_Picker(), store=store))
   finally:
     alarm_link._company_parks = saved
@@ -688,11 +709,11 @@ def test_stored_point_signature_reused_by_other_occurrences():
     ticket_no='T1', occurrence_ts=_ts('2026-11-02 14:03:00'),
     scope='nationwide', status='matched', name='市电中断', match='point',
     alarm={'cluster': 'A', 'event_log_id': 'G1'},
-    point_sig=('A', 'd1', 'P1'), alarm_ts=_ts('2026-11-02 14:03:10'))
+    point_sig=('A', 'd1', 'P1'), alarm_ts=_ts('2026-11-02 14:03:00'))
   store = _Store({first['_id']: first})
-  alarms = [_alarm('G1', '2026-11-02 14:03:10', point_guid='P1', device='UPS-P1'),
-            _alarm('G3', '2026-11-02 14:10:05', point_guid='P1', device='UPS-P1'),
-            _alarm('G4', '2026-11-02 14:10:15', point_guid='P2', device='UPS-P2')]
+  alarms = [_alarm('G1', '2026-11-02 14:03:00', point_guid='P1', device='UPS-P1'),
+            _alarm('G3', '2026-11-02 14:10:00', point_guid='P1', device='UPS-P1'),
+            _alarm('G4', '2026-11-02 14:10:00', point_guid='P2', device='UPS-P2')]
   picker = _Picker(RuntimeError('签名命中不应仲裁'))
   out = _run(stats, recs, repo=_Repo(alarms), picker=picker, store=store)
   assert picker.calls == [], picker.calls
@@ -700,8 +721,8 @@ def test_stored_point_signature_reused_by_other_occurrences():
   cluster = out['clusters'][0]
   assert [v['match'] for v in cluster['occurrences']] == ['point', 'point'], cluster
   assert [a['time'] for a in cluster['alarms']] == [
-    alarm_link._fmt_time(_ts('2026-11-02 14:03:10')),
-    alarm_link._fmt_time(_ts('2026-11-02 14:10:05'))], cluster
+    alarm_link._fmt_time(_ts('2026-11-02 14:03:00')),
+    alarm_link._fmt_time(_ts('2026-11-02 14:10:00'))], cluster
   assert store.saved and store.saved[0]['ticket_no'] == 'T2', store.saved
 
 
@@ -750,7 +771,7 @@ def test_empty_and_error_inputs():
   stats = _stats([{'name': '市电中断', 'count': 2, 'ticketNo': 'T1'}])
   no_time = {'ticketNo': 'T1', 'projectName': '市电中断',
              'companyName': '廊坊园区A1数据中心', 'dc': 'A1分部'}
-  out2 = _run(stats, [no_time], repo=_Repo([_alarm('G1', '2026-11-02 14:03:10')]))
+  out2 = _run(stats, [no_time], repo=_Repo([_alarm('G1', '2026-11-02 14:03:00')]))
   assert out2['clusters'][0]['alarms'] == [], out2
   assert '缺少发生时间' in out2['clusters'][0]['occurrence']['reason'], out2
 

@@ -264,6 +264,15 @@ class Settings(BaseSettings):
   MINERU_TIMEOUT: int = 600
   MINERU_API_POLL_INTERVAL: int = 5
   MINERU_API_MAX_POLL: int = 60
+  # 现场自建的 MinerU 官方 Gradio 服务，如 http://10.100.17.152:7860。
+  # 只暴露 Gradio 协议端点（/convert_to_markdown_stream），与 MINERU_LOCAL_API_URL
+  # （FastAPI /file_parse）是两回事；为空则整条 Gradio 路径关闭。
+  MINERU_GRADIO_URL: str = ''
+  # pipeline（快但扫描件整页丢失）/ vlm-engine（覆盖率最好，默认）/ hybrid-engine
+  MINERU_GRADIO_BACKEND: str = 'vlm-engine'
+  MINERU_GRADIO_TIMEOUT: int = 300      # 单份 SSE 总超时（秒）
+  # **跨进程**并发上限：实测服务端约 3 路并行，4 路起排队
+  MINERU_GRADIO_CONCURRENCY: int = 3
 
   # ==================== Scheduler ====================
   SCHEDULER_ENABLED: bool = True
@@ -552,6 +561,41 @@ class Settings(BaseSettings):
   # 的部分需要手工 `cli --sync` 回填。拉取本身还有 `feishu._MAX_MESSAGES=5000` 兜底。
   FEISHU_GROUP_INGEST_MAX_BACKFILL_HOURS: int = 72
 
+  # ==================== 日常运维：每日变更通知统计 ====================
+  # 6 个园区「日常运维工作」群里人每天手发变更通知（开始/完成），按自然日统计
+  # 「园区 × 数据中心」的变更。**只统计人发的消息**：机器人消息不入库（WS 按
+  # `sender_type=app`、回补按 `sender.id_type=app_id`），读侧仍要求 `sender_id_type='open_id'`。
+  # 落**独立表** `dcim_change_reports`（读时解析，不固化快照）。
+  # 这些群必须同时进 `FEISHU_GROUP_INGEST_CHATS` 才会入库。
+  CHANGE_NOTICE_ENABLED: bool = False
+  # JSON `{园区: chat_id}`。为空 = 关闭（不建预设、不跑定时）。
+  CHANGE_NOTICE_FEISHU_PARK_CHATS: str = ''
+  # 当天 18:10 统计**当天 00:00 ~ 运行时刻**（cron，Asia/Shanghai）。
+  CHANGE_NOTICE_CRON: str = '10 18 * * *'
+  # 报文字段抽取兜底：现场报文写法常变，确定性解析遇到未登记的语义标签时
+  # 让模型从原文抽（只填空字段、已有值绝不覆盖，时间要过区间校验）。
+  CHANGE_NOTICE_EXTRACT_LLM_ENABLED: bool = True
+  # 每轮最多调几次（预算不变，仍裁前 N 条需要兜底的报文）
+  CHANGE_NOTICE_EXTRACT_LLM_MAX_PER_ROUND: int = 20
+  # 抽取并发数：串行时 5 条 × 15s 最坏 75s（页面看着一直转），改为有界并发
+  CHANGE_NOTICE_EXTRACT_LLM_CONCURRENCY: int = 4
+  CHANGE_NOTICE_EXTRACT_LLM_TIMEOUT: int = 15
+  # 页面结果缓存（秒）：按「数据水位」为键，数据没变时进页面直接命中。
+  # 新鲜度由水位保证（新消息入库/撤回都会换键），TTL 只负责回收；0 = 关闭缓存。
+  CHANGE_NOTICE_PAGE_CACHE_SECONDS: int = 120
+  # 现场负责人职级：从综合管理平台人员档案补「现场负责人等级」列。
+  # 关闭后该列恒为空、不发外部请求；查询失败/歧义一律留空（fail-open）。
+  CHANGE_NOTICE_CONTACT_LEVEL_ENABLED: bool = True
+  # 等级命中缓存 7 天（查无此人固定 1 天）。
+  CHANGE_NOTICE_CONTACT_LEVEL_TTL: int = 604800
+  # 变更通知**合规周报**（分析报告 · `changenotice__nationwide__weekly`）的判定参数。
+  # 规则③：完成通知发送时间与实际完成时间的允许偏差（分钟），超过即判「不符」。
+  CHANGE_COMPLIANCE_COMPLETION_DIFF_MINUTES: int = 30
+  # 规则①：计划开始后多少分钟内发开始通知仍算合规（默认 0 = 晚于计划开始即不合规）。
+  CHANGE_COMPLIANCE_LATE_START_GRACE_MINUTES: int = 0
+  # 回看天数：为「上周开始、本周完成」的单找到开始通知，避免误判规则①②。
+  CHANGE_COMPLIANCE_LOOKBACK_DAYS: int = 7
+
   # 实时数据用**独立消费组**：和配置类同组的话，配置线程重启触发的 rebalance
   # 会把实时消费一起带停（同组内不同 topic 的成员是一起 rebalance 的）
   KAFKA_REAL_DATA_GROUP_ID: str = 'rz-dcim-realdata'
@@ -689,18 +733,60 @@ class Settings(BaseSettings):
   DOC_UPDATE_TREE_ID: str = '24CiSBO7cxt'  # 旧单树模式的「数据中心运维管理体系」整树 id
   DOC_UPDATE_CRON: str = '0 3 10 * *'      # 每月 10 日 03:00
   DOC_UPDATE_TIMEOUT: int = 30             # 单文件下载超时（秒）
-  DOC_UPDATE_MAX_FILES: int = 1000         # 安全阀（仅「原地更新型」才下载，按期提交型不下载）
+  DOC_UPDATE_MAX_FILES: int = 1000         # 安全阀（仅「查更新」项才下载，查新增项不下载）
   DOC_UPDATE_COMPANY_ID: str = '27WqDiazDVr'   # 旧格式/tree 模式的默认公司（润泽）
   # 固定「公司 × 部门」清单。格式 `标签:companyId:部门,…`，组间 `;`（两段时标签用 id）；
   # **不带 `:` 的旧值**仍按单公司处理（套 DOC_UPDATE_COMPANY_ID）。
   # 页面列/检查范围都以它为准；新增/撤掉园区或部门改这里（`--refresh-depts` 重解析 id/根目录）。
   DOC_UPDATE_DEPTS: str = (
-    '廊坊:27WqDiazDVr:A1,A2,A3,A5,A6,A7,A8,A9,A10,A11,A12,A18;'
+    '廊坊:27WqDiazDVr:A1,A2,A3,A5,A6,A7,A8,A9,A10,A11,A12,A18,B1M1,B1M2;'
     '平湖:27gIIjyTQ7n:A1,A2;惠州:27gIKJhwwZX:A2,A3;'
     '佛山:27gIL8vGj8F:A1,A2,A3;重庆:27oHS2fq6yp:A1,A2'
   )
-  DOC_UPDATE_DEPT_PATTERN: str = r'^A\d+$'     # 从接口行里认部门名（不作列清单）
-  DOC_UPDATE_PERIOD_GRACE_MONTHS: int = 1      # 本期应到 = 当前月回退 N 月（兼容按报告期/交付月命名）
+  # 从接口行里认部门名（不作列清单）：A 区 `A1`…；廊坊 B 区 `B1M1`/`B1M2`
+  DOC_UPDATE_DEPT_PATTERN: str = r'^(?:A\d+|B1M\d+)$'
+  # 期间 = 应到期（选 11 月就查 11 月报告）。设 N 时期间与该到期一起回退 N 月
+  # （两者永远同源），默认 0 不回退。
+  DOC_UPDATE_PERIOD_GRACE_MONTHS: int = 0
+  # 「查新增」项临时接受前 N 月的文件（默认 0 = 只认本月；11 月检查设 1 时 10 月文件也算已交）。
+  # **只放宽查新增项**，不改 period_key / 期间标签、不影响查更新项（仍按 sha256 比上期）。
+  DOC_UPDATE_NEW_ACCEPT_PREV_MONTHS: int = 0
+  # 共享目录遍历（拦路的不是请求条数，是延迟）：实测 `/file/share/v2/…` 单次 1.4s，
+  # 廊坊 A1 一个部门就 ≥1679 个目录 → 串行约 40 分钟/部门，整轮跑不完。
+  # 该接口实测 8 路并发无报错（3.4 req/s，约 8~10 分钟/部门）；服务端 ~5 req/s 已饱和，
+  # 再高只涨延迟不涨吞吐，故默认 8。
+  DOC_UPDATE_WALK_CONCURRENCY: int = 8
+  DOC_UPDATE_WALK_MAX_DIRS: int = 20000   # 单部门目录数安全阀（A1 实测 ≥1679，旧值 2000 会截断）
+  DOC_UPDATE_WALK_MAX_DEPTH: int = 16     # 目录深度安全阀（A1 存在 >10 层的班组归档目录）
+  # 目录索引（Mongo `doc_update_dir_index`）：全量遍历一次把每项命中的稳定目录 fid 落库，
+  # 日常只列这些固定子树。TTL_DAYS=0 表示**不按时间自动全量**（只有没索引/根列举失败才回退）。
+  DOC_UPDATE_INDEX_TTL_DAYS: int = 0
+  DOC_UPDATE_INDEX_RESCAN_HOURS: int = 24   # 「遍历为空」触发回退全量的最短间隔（防每轮全量）
+  # 扁平「查新增」项（目录只到年份、月份写在文件名里）的期号：确定性文件名解析优先，
+  # 解析不出的（模板/年度汇总）交模型兜底；模型输出过严格校验才写入，失败不影响结论。
+  DOC_UPDATE_PERIOD_LLM_ENABLED: bool = True
+  DOC_UPDATE_PERIOD_LLM_TIMEOUT: float = 20.0
+  # 未找到项的模型复核：同一目录（同一查找范围）下的未找到项**合并成一次调用**按编号
+  # 分派，模型只能在「已解析出的真实文件清单」里原样挑（业务叫法与文件名不同，如
+  # 「客户IT库房应急卡」=「字节IT库房应急卡」）。单次调用要覆盖多条目 × 上百个候选，
+  # 20s 实测超时（单条目调用一次就已 16.4s），故默认 60s。
+  DOC_UPDATE_MATCH_LLM_ENABLED: bool = True
+  DOC_UPDATE_MATCH_LLM_TIMEOUT: float = 60.0
+  # 「疑似没定位到真实记录」时的受控子 agent：确定性匹配按编号命中的往往是外层模板，
+  # 真实按月记录在不带编号的子目录里（如 `2.3.3交接班管理/交接班签字表2026/`）。
+  # 子 agent 只能在**已遍历文件的目录图（allowlist）内**逐层 list_dir 探索、按名称语义
+  # 模糊匹配挑目录，挑到就把该子树文件并入 matched。失败 fail-soft 保持确定性结论。
+  DOC_UPDATE_EXPLORE_ENABLED: bool = True
+  DOC_UPDATE_EXPLORE_TIMEOUT: float = 45.0   # 单次定位总超时（多次工具往返合计）
+  DOC_UPDATE_EXPLORE_MAX_STEPS: int = 6       # 工具往返步数上限
+  DOC_UPDATE_EXPLORE_MAX_DIRS: int = 60       # 可下钻目录数上限
+  DOC_UPDATE_EXPLORE_MAX_ENTRIES: int = 200   # 单次 list_dir 回给模型的条目上限
+  # 同步时自动截图：只为「有未找到项的目录」各截一张（mgmt 共享文档页），
+  # 失败只记提示、绝不影响判定。截图落在宿主机卷里，容器重建不丢。
+  # 本轮先不启用（代码与页面端点保留），需要时置 True 即可。
+  DOC_UPDATE_SCREENSHOT_ENABLED: bool = False
+  DOC_UPDATE_SCREENSHOT_TIMEOUT: float = 90.0
+  DOC_UPDATE_SCREENSHOT_DIR: str = 'data/doc_update/screenshots'
 
   # ==================== 红外巡检图片质量检测 ====================
   # 用户按「部门 → 巡检任务」勾选检测，判定走外部 Gradio 服务（不调 VLM）。
@@ -727,6 +813,35 @@ class Settings(BaseSettings):
   INFRARED_QUALITY_IMAGE_DIR: str = str(
     Path(__file__).parent.parent / 'data' / 'infrared_quality'
   )
+
+  # ==================== 应急演练记录合规审查 ====================
+  # 取每个演练周的 4 份班组 PDF（扫描件）→ 云端 MinerU OCR → 检索知识库 EOP →
+  # LLM 比对 → 结构化合规结论。只需 MGMT_* 与 MINERU_* 已配好，本组默认关闭。
+  DRILL_AUDIT_ENABLED: bool = False
+  DRILL_AUDIT_EOP_GROUP: str = 'default'    # 检索库（单 collection，真正过滤靠 doc_type）
+  DRILL_AUDIT_EOP_TOP_K: int = 6            # 最多取几段 EOP 命中喂给判定模型
+  DRILL_AUDIT_LLM_TIMEOUT: float = 120.0   # 判定模型单次调用超时（秒）
+  DRILL_AUDIT_OCR_TIMEOUT: float = 180.0   # 单份 PDF 云端 OCR 上限（实测约 30s）
+  # 配了 MINERU_GRADIO_URL 时优先走本地 Gradio OCR（vlm-engine，实测 8~10s 且覆盖率最好），
+  # 异常自动回退云端；置 false 可强制只用云端。
+  DRILL_AUDIT_LOCAL_OCR: bool = True
+  DRILL_AUDIT_PARSE_CONCURRENCY: int = 2   # 并发下载+OCR 的班组数
+  DRILL_AUDIT_JUDGE_CONCURRENCY: int = 4   # 并发判定（每班组一次 LLM 调用）的班组数
+
+  # 内容库：已下载的 PDF 与 OCR 文本按内容 sha256 落本地（`data/` 已在 .gitignore），
+  # Mongo 只存索引；命中则零下载零 OCR。不设期限，只按容量淘汰（见 store.py）。
+  DRILL_AUDIT_STORE_ENABLED: bool = True
+  DRILL_AUDIT_STORE_DIR: str = str(
+    Path(__file__).parent.parent / 'data' / 'drill_audit'
+  )
+  DRILL_AUDIT_STORE_MAX_MB: int = 2048     # 容量上限，超了按最久未用淘汰
+
+  # 每周任务：扫描「到点该审的演练周」（已安排、有记录、etime 在回溯窗口内）并落结论。
+  # 需同时 DRILL_AUDIT_ENABLED=true 才生效；不产附件，页面直接读 Mongo 周记录。
+  DRILL_AUDIT_WEEKLY_ENABLED: bool = False
+  DRILL_AUDIT_WEEKLY_CRON: str = '10 7 * * 1'   # 默认周一 07:10，避开报告预设的凌晨槽位
+  DRILL_AUDIT_WEEKLY_DEPTS: str = ''            # 空 = 复用 DOC_UPDATE_DEPTS 的「公司:部门」清单
+  DRILL_AUDIT_WEEKLY_LOOKBACK_DAYS: int = 14    # 回溯窗口：etime 在此区间内的已安排周才审
 
   # ==================== 安防平台集成 ====================
   # 占位注册：暂无接口文档，capabilities 为空元组，client.call 直接抛异常。

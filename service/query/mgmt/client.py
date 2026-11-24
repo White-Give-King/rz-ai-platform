@@ -18,6 +18,8 @@
   该接口把 deptId/page/pageSize 放在 path 里，声明式的 defaults/default_params 在
   `_build_request` 之后才应用、够不到 path 占位符，故路径在
   `_query_equipment_maintenance_flow` 内自行拼接（详见该函数 docstring）。
+  `mgmt.query_drill_plans`（演练计划列表）也走组合能力：需要在应用层按 month 过滤
+  `weeks[]`（EndpointSpec 无后处理钩子），详见 `_query_drill_plans`。
 - `on_behalf_of` 为认证中心身份透传：单接口路径按其 user_id 用该用户自己的
   mgmt token 查询，8 个 pen 组合能力也用该用户身份换发 token/公司部门上下文，
   实现 mgmt/pen 侧数据权限按人生效（user_id 为空才回退服务账号）。
@@ -705,6 +707,235 @@ async def _query_equipment_maintenance_flow(
   )
 
 
+# 演练计划的周级筛选维度：(参数名, weeks[] 里的字段名)。全部按字符串等值比较。
+_DRILL_FILTER_FIELDS = (
+  ('month', 'month'),
+  ('week', 'week'),
+  ('status', 'status'),
+  ('finish_status', 'finishStatus'),
+)
+
+_DRILL_DATE_FMT = '%Y-%m-%d'
+
+
+def _drill_code(value) -> str | None:
+  """把筛选值归一成可比的数字字符串（'11' / '0' / '48'）；空或非法返回 None。"""
+  if value is None or value == '':
+    return None
+  try:
+    return str(int(value))
+  except (TypeError, ValueError):
+    return None
+
+
+def _drill_date(value) -> str | None:
+  """把日期归一成 'YYYY-MM-DD'；空或非法返回 None（该条筛选不生效）。"""
+  if not value:
+    return None
+  try:
+    return datetime.strptime(str(value).strip(), _DRILL_DATE_FMT).strftime(_DRILL_DATE_FMT)
+  except ValueError:
+    return None
+
+
+def _dept_key(value) -> str:
+  """部门名归一：去掉所有空白再 casefold（「A1 分部」≡「A1分部」）。"""
+  return re.sub(r'\s+', '', str(value or '')).casefold()
+
+
+def _drill_plan_key(value) -> str:
+  """计划名归一：去掉所有空白再比，避免「双路市电中断」匹配不到中间带空格的名称。"""
+  return re.sub(r'\s+', '', str(value or '')).casefold()
+
+
+async def _resolve_dept_id(
+  dept_name: str, park: str, user_id: str | None,
+) -> tuple[str, str]:
+  """在「公司范围」内按部门名解析 dept_id，返回 (dept_id, note)。
+
+  为什么必须按公司解析：A1/A18/技术保障部这类名称在多家公司同名（实测 A1分部同时存在于
+  润泽/海外/平湖/佛山/重庆 5 家公司），上游 `query_dept_by_name` 只返回其中一条（实测
+  `A1` 命中的是海外园区那条、该部门没有任何演练计划），跨公司按名称解析会拿到别家公司的部门。
+
+  解析范围：给了 `park` 就按 `gardenName` 包含关系收窄（如「廊坊」→「廊坊园区」），
+  没给就是账号可见的全部公司。公司/部门清单都命中 24h 静态缓存（MGMT_REF_CACHE_TTL），
+  首轮最多 6 次 HTTP，之后走 Redis。
+
+  名称匹配先精确、再去「分部」后缀，**绝不做短代号子串匹配**（否则 A1 会命中 A10）。
+  恰好 1 个 → 返回其 deptId；0 个 → note 列出可用部门；≥2 个 → note 列出候选并要求用户
+  确认园区。note 非空时调用方应原样转述/追问，不猜。
+  """
+  name = _dept_key(dept_name)
+  companies = await call('mgmt.query_company_list', {}, on_behalf_of=user_id)
+  companies = [c for c in companies if isinstance(c, dict)] if isinstance(companies, list) else []
+  if not companies:
+    return '', '未取到账号可见的公司列表，无法解析部门；请向用户确认公司/园区'
+
+  park_key = _dept_key(park)
+  if park_key:
+    narrowed = [
+      c for c in companies if park_key in _dept_key(c.get('gardenName'))
+    ]
+    if not narrowed:
+      gardens = '、'.join(
+        g for g in dict.fromkeys(str(c.get('gardenName') or '') for c in companies) if g
+      )
+      return '', f'没有匹配园区「{park}」的公司，可选园区：{gardens or "（无）"}'
+    companies = narrowed
+
+  matches: dict[str, tuple[str, str]] = {}  # deptId -> (园区名, 部门名)
+  available: list[str] = []
+  for comp in companies:
+    company_id = str(comp.get('companyId') or '')
+    if not company_id:
+      continue
+    garden = str(comp.get('gardenName') or comp.get('companyName') or '')
+    depts = await call(
+      'mgmt.query_dept_list', {'company_id': company_id}, on_behalf_of=user_id)
+    if not isinstance(depts, list):
+      continue
+    for dept in depts:
+      if not isinstance(dept, dict):
+        continue
+      dept_name_full = str(dept.get('deptName') or '')
+      if dept_name_full:
+        available.append(dept_name_full)
+      short = _dept_key(dept.get('deptShortName'))
+      full = _dept_key(dept_name_full)
+      hit = (
+        (short != '' and short == name)
+        or (full != '' and full == name)
+        or (full != '' and full == name + '分部')
+        or (short != '' and short + '分部' == name)
+      )
+      dept_id = str(dept.get('deptId') or '')
+      if hit and dept_id and dept_id not in matches:
+        matches[dept_id] = (garden, dept_name_full)
+
+  if len(matches) == 1:
+    dept_id, (garden, dept_name_full) = next(iter(matches.items()))
+    logger.info(
+      '部门解析 dept_name=%r park=%r → %s（%s %s）',
+      dept_name, park, dept_id, garden, dept_name_full,
+    )
+    return dept_id, ''
+  if not matches:
+    sample = '、'.join(list(dict.fromkeys(available))[:20])
+    scope = f'园区「{park}」' if park_key else '账号可见的公司'
+    return '', (
+      f'{scope}下未找到部门「{dept_name}」，可用部门（部分）：{sample or "（无）"}；'
+      '请向用户确认部门名或园区'
+    )
+  cands = '；'.join(
+    f'{garden} {dept_name_full}（dept_id={dept_id}）'
+    for dept_id, (garden, dept_name_full) in list(matches.items())[:10]
+  )
+  return '', (
+    f'部门「{dept_name}」在 {len(matches)} 家公司同名，请先确认园区：{cands}'
+  )
+
+
+async def _query_drill_plans(params: dict, user_id: str | None = None) -> dict:
+  """查询演练计划列表（组合能力：按 weeks[] 的维度服务端过滤）。
+
+  触发组合能力而非 EndpointSpec 的原因：data 是计划数组、每条内联全年约 50 个 weeks[]
+  （紧凑 JSON ≈7.6k 字符/计划），工具输出上限 AGENT_MAX_TOOL_OUTPUT_CHARS(12,000) 的记录级
+  截断会把**整条计划**从末尾弹掉（_records_lists 不递归 weeks），2 条计划就只剩 1 条。
+  过滤（month / week / status / finish_status / start_date+end_date）在这里做，既贴合
+  「本月」「第 48 周」这类意图，也把载荷降到 12k 以下。
+
+  为什么要服务端筛而不是让模型自己看：模型对返回文本只有注意力近似匹配、没有检索工具，
+  在 50 周 × 多条计划里找 `"week": "48"` 会漏、会错；筛选下沉成参数才可靠。
+
+  三种部门定位口径（优先级从高到低）：
+  1. 显式 `dept_id`；
+  2. `dept_name`(+`park`) —— 服务端按公司解析（`_resolve_dept_id`）；解析不到直接返回
+     `{"plans": [], "note": ...}`，让模型原样转述/追问；
+  3. 都不传 → 当前登录用户所属部门（服务账号回退技术保障部）。
+
+  默认只看**已安排周**：`status` 未显式传时置 '0'（未安排周动辄几十个，会把结果撑爆）；
+  问「哪些周没安排」才显式传 `status=1`。
+
+  口径：各条件**同时生效**；日期区间按周的 stime/etime 与该区间**重叠**判断（只给一端就只
+  判一端）；`plan_name` 按去空白子串过滤计划（`weeks` 不动）；筛不到的周不出现在 weeks[] 里
+  （计划本身保留），某计划 weeks 为空＝该范围内无安排。非法筛选值（如 month='abc'）只记
+  warning 并忽略该条，不影响其它条件。
+  """
+  dept_id = str(params.get('dept_id') or '').strip()
+  if not dept_id and params.get('dept_name'):
+    dept_id, note = await _resolve_dept_id(
+      str(params.get('dept_name')), str(params.get('park') or ''), user_id,
+    )
+    if not dept_id:
+      return {'plans': [], 'note': note}
+  if not dept_id:
+    context = (
+      await http.get_user_context(user_id) if user_id
+      else await http.get_default_context()
+    )
+    dept_id = context.get('own_dept_id') or ''
+  if not dept_id:
+    raise MgmtError('当前账号所属部门未取到，无法查演练计划')
+
+  year = str(params.get('year') or datetime.now().year)
+  data = await http.request(
+    'GET', '/drill/plan/list/v1',
+    params={'deptId': str(dept_id), 'year': year},
+    dept_id=dept_id, user_id=user_id,
+  )
+  if not isinstance(data, list):
+    return {'plans': [], 'note': (
+      f'部门 {dept_id} 下未取到演练计划（该部门可能没有计划，或不是用户所指的那个部门）。'
+      '若用户说的是部门名（A1/A18/技术保障部这类在多家公司同名），改传 dept_name'
+      '（+ park 园区名）让服务端按公司解析，不要用 query_dept_by_name 跨公司拼 dept_id'
+    )}
+
+  plan_key = _drill_plan_key(params.get('plan_name'))
+  if plan_key:
+    data = [
+      p for p in data if isinstance(p, dict) and plan_key in _drill_plan_key(p.get('name'))
+    ]
+    if not data:
+      return {'plans': [], 'note': (
+        f'该部门下没有名称包含「{params.get("plan_name")}」的演练计划；'
+        '可去掉 plan_name 列出全部计划再定位'
+      )}
+
+  # 默认只看已安排周（status=0）；问「哪些周没安排」时显式传 status=1
+  if params.get('status') in (None, ''):
+    params = {**params, 'status': '0'}
+
+  wanted = {key: _drill_code(params.get(key)) for key, _ in _DRILL_FILTER_FIELDS}
+  for key, _ in _DRILL_FILTER_FIELDS:
+    if params.get(key) not in (None, '') and wanted[key] is None:
+      logger.warning('演练计划筛选参数非法，已忽略 %s=%r', key, params.get(key))
+  start = _drill_date(params.get('start_date'))
+  end = _drill_date(params.get('end_date'))
+  if params.get('start_date') and start is None:
+    logger.warning('开始日期非法，已忽略 start_date=%r', params.get('start_date'))
+  if params.get('end_date') and end is None:
+    logger.warning('结束日期非法，已忽略 end_date=%r', params.get('end_date'))
+
+  def _keep(w: dict) -> bool:
+    for key, field in _DRILL_FILTER_FIELDS:
+      target = wanted[key]
+      if target is not None and str(w.get(field)) != target:
+        return False
+    stime = str(w.get('stime') or '')
+    etime = str(w.get('etime') or '')
+    if start and etime and etime < start:
+      return False  # 该周结束早于区间起点
+    if end and stime and stime > end:
+      return False  # 该周开始晚于区间终点
+    return True
+
+  for plan in data:
+    if not isinstance(plan, dict) or not isinstance(plan.get('weeks'), list):
+      continue
+    plan['weeks'] = [w for w in plan['weeks'] if isinstance(w, dict) and _keep(w)]
+  return data
+
+
 async def _query_pen_company_dept(user_id: str | None = None) -> dict:
   """查询当前用户工单服务可见的公司及部门（组合能力：取 kingdeeUid 调 ticket-api）。
 
@@ -1111,7 +1342,7 @@ async def _query_my_info(user_id: str | None = None) -> dict:
   return profile
 
 
-# 静态参考数据缓存能力（公司/部门列表，结构变化少，TTL 1h）
+# 静态参考数据缓存能力（公司/部门列表，结构变化少，TTL 24h＝MGMT_REF_CACHE_TTL）
 _STATIC_REF_CACHE = {'mgmt.query_company_list', 'mgmt.query_dept_list'}
 
 
@@ -1221,6 +1452,7 @@ async def call(
   # query_breakdown_ticket_detail / query_question_ticket_detail / query_event_ticket_detail /
   # query_change_ticket_detail 无 EndpointSpec（登录档案 / pen 公司部门解析 / 内部查人→换 token
   # →调 pen / 公司维度 POST 各类工单列表 / 按 id 查各类工单详情），在 ENDPOINTS 查找之前分流。
+  # 另 `query_drill_plans`（演练计划列表，按 month 过滤 weeks[]）亦走特判。
   if capability_id == 'mgmt.query_my_info':
     logger.info('mgmt.call id=%s params=%s', capability_id, params)
     return await _query_my_info(on_behalf_of)
@@ -1272,6 +1504,9 @@ async def call(
   if capability_id == 'mgmt.query_equipment_maintenance_flow':
     logger.info('mgmt.call id=%s params=%s', capability_id, params)
     return await _query_equipment_maintenance_flow(params, on_behalf_of)
+  if capability_id == 'mgmt.query_drill_plans':
+    logger.info('mgmt.call id=%s params=%s', capability_id, params)
+    return await _query_drill_plans(params, on_behalf_of)
 
   spec = ENDPOINTS.get(capability_id)
   if spec is None:
@@ -1279,7 +1514,7 @@ async def call(
 
   logger.info('mgmt.call id=%s params=%s', capability_id, params)
 
-  # 静态参考数据缓存：公司/部门列表结构变化少，TTL 1h，避免每次 Agent 查询都调 HTTP
+  # 静态参考数据缓存：公司/部门列表结构变化少，TTL 24h（MGMT_REF_CACHE_TTL），避免每次 Agent 查询都调 HTTP
   if capability_id in _STATIC_REF_CACHE:
     scope = on_behalf_of or 'service'
     cache_key = http.ref_cache_key(capability_id, scope, params)

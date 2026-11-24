@@ -21,10 +21,10 @@
 
 | 平台 | 能力数 |
 |---|---|
-| 综合管理平台（mgmt） | 54 |
+| 综合管理平台（mgmt） | 56 |
 | 动力环境数据监控（dcim_meta） | 9 |
 | 安防平台（security） | 0 |
-| **合计** | **63** |
+| **合计** | **65** |
 
 ## 动力环境数据监控（dcim_meta）
 
@@ -76,7 +76,7 @@
 - 查询我的账号信息（`mgmt.query_my_info`）→ 无独立 HTTP 接口（认证中心登录档案，`client.py _query_my_info`）；无参数
 - 查询我的公司及部门（`mgmt.query_pen_company_dept`，工单服务）→ GET `{TICKET}/company/user/{kingdeeUid}`；无参数
 - 按姓名查询人员信息（`mgmt.query_person_by_name`）→ GET `{MGMT}/user/info/v2/{name}`；参数：**name**
-- 按部门名称模糊查询部门（`mgmt.query_dept_by_name`）→ GET `{MGMT}/dept/v1/dept/{deptName}`；参数：**dept_name**
+- 按部门名称模糊查询部门（`mgmt.query_dept_by_name`）→ GET `{MGMT}/dept/v1/dept/{deptName}`；参数：**dept_name**（**已降级**：上游只返回同名部门中的一条，实测 `A1` 返回海外园区 A1分部；不能跨公司解析 dept_id，仅名称全局唯一且公司已明确时兜底）
 - 按 uid 查询人员详情（`mgmt.query_person_by_id`）→ POST `{MGMT}/user/records/v2`；参数：**uid**、dept_id、company_id
 - 查询员工变更工单（`mgmt.query_employee_ticket`）→ POST `{MGMT}/user/records/ticket/v1`；参数：**user_id**、**ticket_type**、company_id、page、page_size
 - 查询人员培训信息（`mgmt.query_person_training`，month 为季度索引 1-4，时间范围自动补全）→ POST `{MGMT}/user/records/training/v1`；参数：**uid**、**year**、**month**、start_time、end_time、**is_pass**、**plan_status**
@@ -84,7 +84,11 @@
 - 查询人员机房巡检记录（`mgmt.query_person_inspection`）→ POST `{MGMT}/user/records/inspection/v1`；参数：**uid**、dept_id、company_id、page、page_size
 - 查询公司列表（`mgmt.query_company_list`）→ GET `{MGMT}/authority/userrole/v1/current/company`；无参数
 - 查询部门人员列表（`mgmt.query_user_list`）→ GET `{MGMT}/user/dept/v4/page`；参数：**dept_id**、**profession**（供配电/制冷/智能化/其他）、page、page_size
-- 查询公司下的部门列表（`mgmt.query_dept_list`）→ GET `{MGMT}/authority/userrole/v3/current/dept?companyId=`；参数：company_id
+- 查询公司下的部门列表（`mgmt.query_dept_list`）→ GET `{MGMT}/authority/userrole/v3/current/dept?companyId=`；参数：company_id（**解析 dept_id 的首选**：按公司隔离、天然区分跨公司同名部门；不传 company_id 即本人公司。走静态参考缓存，TTL 24h）
+
+> **部门解析口径：先定公司、后取部门**。用户提到园区（廊坊/平湖/惠州/佛山/重庆/海外）时，
+> `query_company_list` 按 `gardenName` 定位公司 → `query_dept_list(company_id)` 选 dept_id；
+> 未提园区则默认本人公司。`query_dept_by_name` 已降级，不得用于跨公司解析。
 
 ### 巡检（inspection，走 INSPECT 根路径）
 
@@ -148,6 +152,22 @@
 
 - 查询评审预约列表（`mgmt.query_review_appointment`）→ POST `{MGMT}/review_appointments/list/v1`；参数：**type**、dept_id、company_id、**start_time**、**end_time**、**is_all**、page、page_size
 - 查询评审预约详情（`mgmt.query_review_appointment_detail`）→ GET `{MGMT}/review_appointments/detail/v1/{id}`；参数：**appointment_id**
+
+### 演练（drill）
+
+- 查询演练计划列表（`mgmt.query_drill_plans`）→ 组合能力，见 `client._query_drill_plans`：GET `{MGMT}/drill/plan/list/v1`；参数：dept_id、**dept_name**、**park**、**plan_name**、year、**month**、**week**、**status**、**finish_status**、**start_date**、**end_date**（data 即演练计划数组，每条内联 `weeks[]`；各筛选条件同时生效，服务端按 `weeks[]` 过滤，日期区间按 stime/etime 重叠判断，避免全年约 50 周撑过工具输出上限、末尾计划被整条截断；**status 未传默认只看已安排周**；`plan_name` 按去空白子串筛具体计划，`{"plans": [], "note": …}` 时 note 是下一步指引）
+- 查询演练周明细（`mgmt.query_drill_week`）→ GET `{MGMT}/drill/plan/week/v1/{week_id}`；参数：**week_id**（含 A/B/C/D 四班组记录文件 id/名称）
+
+> 与内置工具 `drill_compliance_audit`（审查流水线：下载扫描件、OCR、比对 EOP）分工不同——
+> 本组只查计划与周安排，不下载、不解析记录文件内容。`drill_compliance_audit` 受
+> `DRILL_AUDIT_ENABLED` 门控，这两条 mgmt 能力只受 `MGMT_ENABLED` 门控。
+> **部门解析必须先定公司**：「A18」「技术保障部」是名称不是 id，且 A1/A18 这类名称在多家
+> 公司同名（A1分部在润泽/海外/平湖/佛山/重庆 5 家公司都有）。`query_dept_by_name`
+> 只返回同名部门中的一条（实测 `A1` 返回海外园区 A1分部，该部门无任何计划），**不能**用来
+> 跨公司解析。正确顺序：`query_company_list` 按 `gardenName` 定位公司 → `query_dept_list(company_id)`
+> 选 dept_id；或直接给 `query_drill_plans` 传 `dept_name` + `park`，由服务端
+> `client._resolve_dept_id` 确定性解析（0 个/多个命中都回 note，不猜）。
+> 问「本月/某月」传 `month` 收窄。
 
 ## 安防平台（security）
 

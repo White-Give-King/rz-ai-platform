@@ -666,6 +666,42 @@ async def request(
   raise MgmtError(f'综合管理平台调用失败 path={path}: {body.get("msg", "未知错误")}')
 
 
+async def download_bytes(
+  path: str,
+  *,
+  dept_id: str | None = None,
+  base_url: str | None = None,
+  user_id: str | None = None,
+  _retried: bool = False,
+) -> bytes:
+  """下载原始字节（二进制接口，如演练记录 PDF）。
+
+  `request()` 只解析 JSON 信封，无法取文件。这里同样带 token + Deptid 头，
+  **不解析信封**，直接返回响应体；鉴权失效（401/403）时清缓存重登一次。
+  """
+  if user_id:
+    token, default_dept = await get_user_token_and_dept(user_id)
+  else:
+    token, default_dept = await _get_token_and_dept()
+  headers = {'token': token, 'Deptid': dept_id or default_dept}
+  url = f'{base_url or settings.MGMT_BASE_URL}{path}'
+  async with httpx.AsyncClient(timeout=settings.MGMT_TIMEOUT) as client:
+    resp = await client.get(url, headers=headers)
+  if resp.status_code in (401, 403) and not _retried:
+    logger.info('mgmt 下载鉴权失效，清缓存重登一次 path=%s', path)
+    if user_id:
+      clear_user_token(user_id)
+    else:
+      redis_manager.client.delete(redis_manager.key(_TOKEN_KEY))
+      redis_manager.client.delete(redis_manager.key(_DEPTID_KEY))
+    return await download_bytes(
+      path, dept_id=dept_id, base_url=base_url, user_id=user_id, _retried=True,
+    )
+  if resp.status_code != 200:
+    raise MgmtError(f'综合管理平台下载失败 path={path}: HTTP {resp.status_code}')
+  return resp.content
+
+
 async def ticket_request(
   path: str,
   params: dict | None = None,

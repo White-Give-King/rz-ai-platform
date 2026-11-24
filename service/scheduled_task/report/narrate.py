@@ -129,6 +129,8 @@ _PRIORITIES = ('P0', 'P1', 'P2')
 _EVAL_FRAME = (
   '本报告是**周期性运行评价**：读者要判断"这段时间运行得怎么样"，不是要一份整改方案。\n'
   '评价 = 事实 + 水平/方向（改善 / 持平 / 恶化）+ 依据；'
+  '**方向的依据必须是本章给出的两期同口径数据**（如本期与上期的同一指标），'
+  '只有单期数据时就只陈述水平。'
   '数据不足以支撑结论时，就如实说明数据不足，**不要补一个解释**。\n'
 )
 
@@ -304,14 +306,18 @@ _BRIEFS: dict[str, str] = {
                '（帕累托图：哪几类设备贡献了大部分故障；散点图：横轴＝故障单量、纵轴＝处理时长 P50，'
                '右上象限＝"高频且高耗时"，最值得关注）。要说清 Top 设备类型指向什么'
                '（是共性短板还是常态磨损）、专业集中度说明什么；数据支持时才提维护方向。',
-  'dept': '故障部门分布与环比：故障单量最多的部门/分部及其占比，以及**各部门环比增减**'
-          '（发散条形：本期 − 上期，增为橙、减为绿）。要说清故障在部门上的集中度、'
-          '**哪些部门在恶化/哪些在改善**；差异只在数据支持时才展开，没有恶化就如实写改善/持平。',
+  'dept': '故障部门分布与处置时长：故障单量最多的部门/分部及其占比、**各部门环比增减**'
+          '（发散条形：本期 − 上期，增为橙、减为绿），以及**各部门处置时长 P50/P90**'
+          '（表里带本期与上期 P50）。要说清故障在部门上的集中度；'
+          '**时长方向（上升 / 下降 / 持平）必须以同时给出的本期与上期 P50 两列为依据**，'
+          '只给到单期数据时就只陈述本期水平。',
   'risk': '工单质量与现存风险：超 1 天未处理完占比、驳回率、关闭率，以及现存风险清单'
           '（未关闭 / 长时间未处理 / 重复故障三类）。要说清风险规模、哪类风险的处置更紧迫、'
           '涉及哪些代表工单；数据支持时才指出先处理哪一类。',
   'duration': '处理时效分析（口径＝**{duration_label}**）：P50/P90/P95、超时/超期单数、最慢部门、最长单。'
               '要说清卡在哪一档、哪些部门最慢、是现场处置慢还是流程环节积压。'
+              '部门时长若带**本期与上期 P50 两列**，方向判断（上升/下降/持平）以这两列为依据；'
+              '只有单期数据时就只陈述本期水平。'
               '数据里若另有「影响时长」（详情口径）：说明**业务影响的持续时间**分布'
               '（多数单影响多久、最长多久、各级别差异），与验收时长**分开陈述、不混用、'
               '不换算**；两者高低不一致本身是信息（如验收慢但影响短）。',
@@ -321,8 +327,8 @@ _BRIEFS: dict[str, str] = {
             '（是设备/机房的共性，还是个别单的巧合）。'
             '数据里若带「关联告警」（DCIM 告警）：可引用它说明该类重复事件对应哪条告警、'
             '当时的告警值与越限档位；**不得换算单位、不做四则运算**。'
-            '未关联到告警时如实写「未关联到 DCIM 告警」，**不得推断为没有告警**'
-            '（覆盖范围说明由平台给出）。',
+            '未关联到告警时如实写「未关联到 DCIM 告警」即可，'
+            '不要自行补充覆盖范围或推测原因。',
   'root_cause': '高频问题的根因分析：依据给定的详情（原因/处置原文、设备品牌型号等）。'
                 '要把根因归类（负载/设备/采集/流程/备件）并归纳共性原因；'
                 '取不到详情的如实说明数据不足。'
@@ -473,6 +479,12 @@ def _trim_stats(stats: dict) -> dict:
     '工单质量': {k: v for k, v in (stats.get('quality') or {}).items() if v is not None},
     '重复问题': stats.get('repeat') or [],
   }
+  # 部门处置时长（本期 vs 上期）：故障单才有该键（变更单的部门行没有 p50）。
+  # 综合评价/行动计划要判方向，同样需要两期同口径数据。
+  dept = stats.get('dept') or {}
+  dur_rows = _dept_duration_rows(dept.get('rows'), dept.get('min_n', 3))
+  if dur_rows:
+    out['各部门处理时长（本期 vs 上期）'] = dur_rows
   # 综合评分带「含义」列（含「规模控制：下降满分」）——行动计划与执行摘要都要据此
   # 判方向，否则会把改善当问题写成"要治理"。
   card = (stats.get('scorecard') or {}).get('rows')
@@ -603,8 +615,7 @@ def _alarm_link_view(details: dict) -> dict | None:
         '越限档': '、'.join(a.get('breached') or []) or '未越限',
       } for a in (cluster.get('alarms') or [])],
     })
-  return {'已关联类别': link.get('linked_n'), '各类目': rows,
-          '覆盖说明': link.get('note') or ''}
+  return {'已关联类别': link.get('linked_n'), '各类目': rows}
 
 
 def _trim_extras(stats: dict) -> dict:
@@ -639,6 +650,36 @@ def _duration_view(block: dict | None) -> dict:
     text = (b.get('readable') or {}).get(k) or _human_minutes(b.get(k))
     if text != '—':
       out[k] = text
+  return out
+
+
+def _dept_duration_rows(rows, min_n: int = 3) -> list[dict]:
+  """部门处置时长（本期 vs 上期）→ 键名写明量纲与差值，模型照抄即可。
+
+  **上期为 None 时明写"无上期数据"（不给 0）**：否则模型会把"没有上期"读成"上期为 0"，
+  进而判出一个不存在的方向。`P50变化（本期−上期）` 是 `compare_guard.DELTA_KEYS` 的一员
+  ——合法地写「较上期上升 X」时，X 必须来自这里。
+  """
+  out = []
+  for r in rows or []:
+    if 'p50' not in r:
+      continue
+    if (r.get('count') or 0) < min_n and (r.get('prev') or 0) < min_n:
+      continue
+    item = {'部门': r['name'], '本期单量': r['count'],
+            '本期P50': _human_minutes(r.get('p50')),
+            '本期P90': _human_minutes(r.get('p90'))}
+    if r.get('prev_p50') is not None:
+      item['上期P50'] = _human_minutes(r['prev_p50'])
+      d = r.get('p50_delta')
+      if d is not None:
+        item['P50变化（本期−上期）'] = (
+          '持平' if not d else
+          f'{"上升" if d > 0 else "下降"} {_human_minutes(abs(d))}')
+    else:
+      item['上期P50'] = '无上期数据（样本不足 3 单或上期无该部门）'
+      item['P50变化（本期−上期）'] = '无上期数据，不判方向'
+    out.append(item)
   return out
 
 
@@ -738,11 +779,16 @@ def _section_payload(stats: dict, details: dict, spec, role: str) -> dict:
       # **与第 5 章表格同一切片**（前 `DEPT_TABLE_LIMIT` 行）：否则要点会讲到表里看不到的部门
       rows = dept['rows'][:DEPT_TABLE_LIMIT]
       d['部门分布'] = _compare_rows(rows, 'name')
-      # 只给单量与两类 P50：三个率已在第 7/8/9 章各自说过，重复下发会让模型再讲一遍
-      d['部门效率'] = [{'部门': r['name'], '单数': r['count'],
-                        '审批P50': _human_minutes(r.get('approve_p50')),
-                        '实施P50': _human_minutes(r.get('exec_p50'))}
-                       for r in rows]
+      # 故障单行里带处置时长 P50（本期/上期）→ 直接给两期可比数据；
+      # 变更单没有 p50 键 → 仍给审批/实施 P50，本节逐字不变。
+      if any('p50' in r for r in rows):
+        # 与上面的「部门分布」同一切片：否则要点会讲到第 5 章表里看不到的部门
+        d['部门效率'] = _dept_duration_rows(rows, dept.get('min_n', 3))
+      else:
+        d['部门效率'] = [{'部门': r['name'], '单数': r['count'],
+                          '审批P50': _human_minutes(r.get('approve_p50')),
+                          '实施P50': _human_minutes(r.get('exec_p50'))}
+                         for r in rows]
   elif role == 'specialty':
     d = {'总量': stats.get('total'), '上一期总量': stats.get('prev_total'),
          '专业分布': _compare_rows(stats.get('specialty'))}
@@ -757,6 +803,9 @@ def _section_payload(stats: dict, details: dict, spec, role: str) -> dict:
     d = {'总量': stats.get('total'), '上一期总量': stats.get('prev_total'),
          '部门（含本期/上期/环比增减）': _compare_rows(dept.get('rows'), 'name'),
          '部门数': dept.get('classes') or 0}
+    dur_rows = _dept_duration_rows(dept.get('rows'), dept.get('min_n', 3))
+    if dur_rows:
+      d['各部门处理时长（本期 vs 上期）'] = dur_rows
   elif role == 'risk':
     d = {'工单质量': stats.get('quality'), '现存风险': stats.get('risk')}
   elif role == 'duration':
@@ -767,6 +816,11 @@ def _section_payload(stats: dict, details: dict, spec, role: str) -> dict:
          '各园区时长': extras.get('各园区时长'),
          '最慢部门': extras.get('最慢部门'),
          '最长单': extras.get('最长验收单') or extras.get('最长处理单')}
+    dept = stats.get('dept') or {}
+    dur_rows = _dept_duration_rows(dept.get('rows'), dept.get('min_n', 3))
+    if dur_rows:
+      # 本期与上期 P50 并列：方向判断必须有这两列，只有「最慢部门」（本期单期）时不给方向
+      d['各部门处理时长（本期 vs 上期）'] = dur_rows
     # 影响时长是**详情口径**，与上面的验收时长并列给出（提示词明令不得混用/换算）
     iv = _impact_view(details)
     if iv:

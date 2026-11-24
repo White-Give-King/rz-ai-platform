@@ -11,7 +11,7 @@
 
 在此之上进一步演进出了 **Agent 智能体平台**：Agent 能按用户问题自主规划意图、调用平台工具获取实时运维数据（告警/设备台账/维护计划/人员信息等）、把全量数据物化到沙箱做统计分析、生成图表与报告文件，让运维工程师用自然语言完成「查数据 → 分析 → 出结论/报告」的完整链路。
 
-平台另有若干**确定性流水线**（不依赖模型自由发挥）：周期性的五类工单分析报告、告警不合规班次检查、月度文档更新检查、红外巡检图片质检、数据中心事件统计表；对外通过 Web 页面、飞书机器人与微信机器人三个入口提供服务。
+平台另有若干**确定性流水线**（不依赖模型自由发挥）：周期性的五类工单分析报告、告警不合规班次检查、月度文档更新检查、红外巡检图片质检、数据中心事件统计表、园区日常变更统计（每日）；对外通过 Web 页面、飞书机器人与微信机器人三个入口提供服务。对话侧另有**应急演练记录合规审查**：取该演练周 4 份班组扫描件 PDF → OCR → 与知识库 EOP 比对，**每份班组记录独立判定**，给出各组综合评价、问题清单与按严重程度的统计，并附问题明细表与整理的演练过程（文字时间轴 + 流程图）供在线查看（同份记录解析后落本地内容库复用，不重复下载与 OCR）。该能力已接入合规检查页（第五张卡 + 整屏看板：部门 × 月份 → 演练计划 → 已审周 → 单周各组流程图/步骤/问题）并按周定时扫描到点该审的演练周。
 
 目标用户场景：运维工程师日常监控、故障排查、知识查询、工单与值班通知。
 
@@ -46,9 +46,9 @@ cd deploy && docker compose up -d
 | 类别 | 开关 |
 |------|------|
 | Agent | `AGENT_ENABLED`（对话入口）· `AGENT_ANALYSIS_ENABLED`（数据分析沙箱）· `VIDEO_AGENT_ENABLED`（讲解视频） |
-| 平台工具 | `MGMT_ENABLED`（综合管理 54 条）· `DCIM_ENABLED`（动环监控 9 条）· `SECURITY_ENABLED`（占位）· `WEB_ENABLED`（联网检索/抓取） |
+| 平台工具 | `MGMT_ENABLED`（综合管理 56 条）· `DCIM_ENABLED`（动环监控 9 条）· `SECURITY_ENABLED`（占位）· `WEB_ENABLED`（联网检索/抓取） |
 | 页面截图 | `BROWSER_ENABLED`（按配方截图）· `BROWSER_EXPLORE_ENABLED`（交互浏览：打开/点击/读文本/录像） |
-| 定时与检查 | `SCHEDULED_TASKS_ENABLED`（定时任务 + 分析报告预设）· `COMPLIANCE_ENABLED`（告警不合规检查）· `DOC_UPDATE_CHECK_ENABLED`（文档更新检查）· `INFRARED_QUALITY_ENABLED`（红外图片质检）· `INCIDENT_STATS_ENABLED`（事件统计表） |
+| 定时与检查 | `SCHEDULED_TASKS_ENABLED`（定时任务 + 分析报告预设）· `COMPLIANCE_ENABLED`（告警不合规检查）· `DOC_UPDATE_CHECK_ENABLED`（文档更新检查）· `INFRARED_QUALITY_ENABLED`（红外图片质检）· `INCIDENT_STATS_ENABLED`（事件统计表）· `CHANGE_NOTICE_ENABLED`（日常变更统计）· `DRILL_AUDIT_ENABLED`（应急演练审查）· `DRILL_AUDIT_WEEKLY_ENABLED`（演练审查每周扫描） |
 | 数据接入 | `DCIM_KAFKA_ENABLED`（Kafka worker 总开关，另有实时/告警/工单三个独立开关）· `LARK_ENABLED`（飞书机器人）· `FEISHU_GROUP_INGEST_ENABLED`（园区群消息入库）· `WECHAT_ENABLED`（微信机器人） |
 
 静态检查与自检（仓库未装 pytest，自检均为纯 assert + 非零退出码，秒级完成）：
@@ -64,6 +64,8 @@ cd web && npm run lint && npm run build
 python -m service.scheduled_task.report.tests.test_report_spec
 python -m service.scheduled_task.compliance.tests.test_compliance
 python -m service.infrared_quality.tests.test_infrared_quality
+python -m service.drill_audit.tests.test_drill_audit
+python -m service.drill_audit.tests.test_weekly
 python -m service.dcim_ingest.tests.test_shard_columns
 ```
 
@@ -74,9 +76,10 @@ api/v1/      →  FastAPI 路由（auth/rag/chat/risk/video/agent/agent_video/ad
                 feedback/health/scheduled_tasks/skills/tools/feishu/wechat）
 service/     →  业务逻辑
                 rag/ risk/ auth/ video/ agent/ agent_video/ query/（平台能力检索层）
-                scheduled_task/  定时任务 + 五类确定性报告 + 事件统计 + 告警不合规检查
+                scheduled_task/  定时任务 + 五类确定性报告 + 事件统计 + 日常变更统计 + 告警不合规检查
                 doc_update/      月度文档更新检查
                 infrared_quality/ 红外巡检图片质量检测
+                drill_audit/     应急演练记录合规审查（PDF OCR × 知识库 EOP，含每周任务与合规页看板）
                 dcim_ingest/     DCIM Kafka 接入与落库
                 channels/        飞书/微信通道公共件
                 feishu/ wechat/  IM 机器人
@@ -86,7 +89,7 @@ config/      →  配置与连接（settings / mongodb / redis / logger）
 models/      →  Pydantic DTO
 middleware/  →  ASGI 中间件（JWT 注入）
 repository/  →  RAG 数据层（Milvus 向量库 / 文档加载 / 切分 / 稀疏编码）
-tools/       →  Agent 工具（知识检索 / 时间 / 通知 / 沙箱分析 / 定时任务 / 事件统计 / 视频生成）
+tools/       →  Agent 工具（知识检索 / 时间 / 通知 / 沙箱分析 / 定时任务 / 事件统计 / 日常变更统计 / 视频生成）
 web/         →  前端（React + TS + Vite + Tailwind）
 skills/      →  Agent 技能目录（chart、html_dashboard、deep_research 等，SKILL.md 自动发现；
                 用户自建技能在 skills/users/<uid>/）
@@ -102,8 +105,9 @@ deploy/      →  Docker Compose 部署 + browser 旁路容器 + 运维脚本
 | 对话 | `/assistant` 对话（RAG + Agent，含任务模式 / 计划模式 / 联网搜索开关） |
 | AI 能力 | `/knowledge` 知识库 · `/risk` 隐患检测 · `/fire-safety` 消防配置 · `/video` 视频生成 |
 | AI 能力 | `/scheduled-tasks` 定时任务 · `/analysis-reports` 分析报告（系统预设、共享只读） |
-| AI 能力 | `/compliance` 不合规检查（班次检查 + 事件统计 + 文档更新 + 红外质检） |
-| 智能体 | `/agent-skills` 技能中心（`/agent-tools`、`/agent` 重定向至此），工具目录在窗内打开 |
+| AI 能力 | `/compliance` 不合规检查（班次检查 + 文档更新 + 红外质检 + 演练审查） |
+| AI 能力 | `/ops` 日常运维（卡片入口 → `/ops/change-notice` 变更统计 · `/ops/incident-stats` 事件统计，数据均来自飞书园区群消息） |
+| 工作台 | `/agent-skills` 智能体（`/agent-tools`、`/agent` 重定向至此），技能与工具目录，工具在窗内打开 |
 | 平台 | `/` 仪表盘 · `/innovation` 创新工坊 · `/permission` 权限申请/审批 · `/auth-center` 认证中心 · `/settings` 设置 · `/admin` 管理后台 |
 
 ## 核心实现架构链路
@@ -138,7 +142,7 @@ deploy/      →  Docker Compose 部署 + browser 旁路容器 + 运维脚本
   → 结果流回前端 → <chart> 标签本地渲染图表、<file> 标签下载产物（.html 看板走右侧 ArtifactPanel iframe 预览）
 ```
 
-- **平台能力注册**：`service/query/bootstrap.py` 按 `<PLATFORM>_ENABLED` 注册 mgmt（54 条）/ dcim_meta（9 条）/ security（占位）/ web（联网 2 条）/ browser（按配方截图，独立 Playwright 旁路容器）等平台 + skills 技能平台（无开关常驻，`skills/` 目录自动发现）。每平台 `capabilities.py`（能力声明）+ `endpoints.py`（EndpointSpec 接口）+ `client.py`（通用调用器）三件套；browser 平台用 `recipes.py` 声明式配方替代 endpoints。
+- **平台能力注册**：`service/query/bootstrap.py` 按 `<PLATFORM>_ENABLED` 注册 mgmt（56 条）/ dcim_meta（9 条）/ security（占位）/ web（联网 2 条）/ browser（按配方截图，独立 Playwright 旁路容器）等平台 + skills 技能平台（无开关常驻，`skills/` 目录自动发现）。每平台 `capabilities.py`（能力声明）+ `endpoints.py`（EndpointSpec 接口）+ `client.py`（通用调用器）三件套；browser 平台用 `recipes.py` 声明式配方替代 endpoints。
 - **promote 机制**：海量工具 schema 默认隐藏（`DeferredToolFilterMiddleware`），仅按意图预 promote 相关工具组；未命中时 LLM 用 `tool_search` 语义检索按需加载。
 - **数据分析沙箱**：`analysis_load` 分页拉全量数据落盘（原始记录不进上下文）→ `analysis_exec` 在受限子进程跑 pandas（`python -I` + 内存/CPU 限制 + 禁网络/禁子进程 + 外部超时）→ `result` 变量产出 `chart_data`、文件产出 `artifacts`。
 - **图表渲染**：LLM 输出 `<chart type="...">JSON</chart>`，前端 `ChartRenderer.tsx` 用 @ant-design/plots + @ant-design/graphs **本地渲染 26 种图表**，数据不出内网。
@@ -193,14 +197,22 @@ Redis 不可用 / 调度器禁用时降级为本地信号量。
 
 ### 8. 运营监控中心（`/compliance`）
 
-不合规检查页聚合四类与班次无关的常态化检查，各自按周期产出 Excel / 交互表格：
+不合规检查页聚合与班次无关的常态化检查，各自按周期产出 Excel / 交互表格：
 
 | 检查 | 目录 | 口径 |
 |------|------|------|
-| 事件统计表 | `scheduled_task/incident_stats/` | 飞书园区群通报为入口，一行 = 一次已通报事件（速报 + 通报配对），按告警触发态时间精确同秒匹配 |
 | 告警不合规检查 | `scheduled_task/compliance/` | 按班次核对四项：响应超时 / 未关单 / 未解除关单 / 重复告警 |
-| 文档更新检查 | `doc_update/` | 25 项月度文档 × 各公司各部门，按期提交型看月份目录、原地更新型比 sha256 |
+| 文档更新检查 | `doc_update/` | 25 项月度文档 × 各公司各部门；标「线上更新」的项比内容 sha256，其余查本期是否交了新文件 |
 | 红外图片质检 | `infrared_quality/` | 按用户勾选的巡检任务逐张送外部 Gradio 模型，sharp/borderline/defocused → 合格/待复核/不合格，fail-closed |
+
+「AI 能力 → 日常运维」落地页（`/ops`）以卡片聚合两项**以飞书园区群消息为数据源**的统计：
+
+| 页面 | 目录 | 口径 |
+|------|------|------|
+| 变更统计 `/ops/change-notice` | `scheduled_task/change_notice/` | 园区日常运维群里**人发的**每日变更通知（机器人卡片不计），按自然日汇总「园区 × 数据中心」的变更类型 / 维护事项 / 执行状态 |
+| 事件统计 `/ops/incident-stats` | `scheduled_task/incident_stats/` | 飞书园区群通报为入口，一行 = 一次已通报事件（速报 + 通报配对），按告警触发态时间精确同秒匹配 |
+
+两者的原始消息都落在 PG `dcim_incident_reports`（`FEISHU_GROUP_INGEST_ENABLED` 旁路入库），读时按窗口解析，不固化快照。
 
 ### 9. DCIM 动环数据接入（Kafka → PostgreSQL + TDengine）
 
@@ -224,7 +236,7 @@ Kafka（配置类每小时全量重推 + 实时采样 + 告警/工单）
 
 - 通道公共件在 `service/channels/`（一次性绑定码、签名下载 token、选主锁、`<file>/<chart>` 标签降级、SSE 消费）。
 - 多 worker 靠 Redis 选主锁保证单消费：飞书 WS 不可重放但消息列表可回捞；微信游标单消费，失主即停。
-- 园区群消息另有旁路入库（`FEISHU_GROUP_INGEST_ENABLED`），只入库不进对话，供事件统计表使用。
+- 园区群消息另有旁路入库（`FEISHU_GROUP_INGEST_ENABLED`），只入库不进对话，供事件统计表与日常变更统计使用。
 
 ## 预置权限
 
@@ -233,7 +245,7 @@ Kafka（配置类每小时全量重推 + 实时采样 + 告警/工单）
 | 权限 | 说明 |
 |------|------|
 | `ai:chat` | AI 对话 |
-| `ai:agent` | Agent 对话、沙箱产物下载、分析报告页、不合规检查页、技能中心 |
+| `ai:agent` | Agent 对话、沙箱产物下载、分析报告页、不合规检查页、日常运维页、智能体 |
 | `ai:knowledge` | 知识库管理 |
 | `ai:risk` | 隐患识别 |
 | `ai:fire_safety` | 消防配置 |
@@ -266,5 +278,5 @@ Kafka（配置类每小时全量重推 + 实时采样 + 告警/工单）
 | 工单服务（ticket-api） | 变更/故障/问题/事件/阈值工单列表与详情 |
 | 飞书 / 微信 | IM 机器人入口（`LARK_ENABLED` / `WECHAT_ENABLED`） |
 | 红外质检服务 | 外部 Gradio 模型，图片清晰度三分类 |
-| MinerU | PDF 解析（`MINERU_ENABLED=true` 时启用） |
+| MinerU | PDF 解析（`MINERU_ENABLED=true` 时启用）；配 `MINERU_GRADIO_URL` 优先走现场 Gradio 服务，云端 v4 兜底 |
 | Coze Studio | 后台 API 代理（已配置，`service/coze_proxy/` 未实现） |

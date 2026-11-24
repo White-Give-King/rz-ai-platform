@@ -250,9 +250,9 @@ async def run_report_workflow(task, spec, now=None) -> None:
                     for r in cur_recs if str(r.get('ticketNo') or '').strip()}
       if any(park_by_no.values()):
         for row in rows:
-          park = park_by_no.get(str(row.get('ticketNo') or '').strip(), '')
-          if park:
-            row['park'] = park
+          row_park = park_by_no.get(str(row.get('ticketNo') or '').strip(), '')
+          if row_park:
+            row['park'] = row_park
       failed = sum(1 for r in rows if r.get('error'))
       logger.info('详情取数：请求 %d 条，成功 %d 条，失败 %d 条，耗时 %.1fs（period=%s）',
                   len(nos), len(rows) - failed, failed, time.time() - t_fetch, period)
@@ -304,7 +304,7 @@ async def run_report_workflow(task, spec, now=None) -> None:
     if details['highlights'].get('summary'):
       logger.info('本期整体表现：%s', details['highlights']['summary'])
 
-    # 重复类目关联 DCIM 告警（事件单专属）：取代表单发生时间点查 ±2 分钟，
+    # 重复类目关联 DCIM 告警（事件单专属）：逐次发生按发生时间**精确同秒**查候选，
     # 多候选由模型仲裁，给出告警值与四档阈值。失败只记日志，不影响报告。
     if spec.ticket == 'event':
       details['alarm_links'] = await alarm_link.link_repeat_alarms(

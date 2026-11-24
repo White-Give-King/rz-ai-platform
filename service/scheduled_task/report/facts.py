@@ -350,14 +350,43 @@ def _impact_level_facts(imp: dict | None) -> list[str]:
 
 
 def _dept_facts(dept: dict | None) -> list[str]:
-  """单园区「部门维度」→ 逐部门一句（单量/环比/审批与实施 P50，与部门表列一致）。
+  """单园区「部门维度」→ 逐部门一句。
 
-  三个率（紧急/按时/驳回）不再下发：表里已删掉这三列，喂给模型只会让它把这几个数
-  再讲一遍（紧急占比在第 7 章、按时率在第 9 章、驳回率在第 8 章异常表各有出处）。
+  - **故障单**（行里带 `p50` 键）：单量/环比 + **处置时长 本期 P50/P90、上期 P50**。
+    只有两期都有 P50 才写出方向（"较上期上升/下降"），缺上期数据就明写"上期无同期数据"。
+    行集合与第 7 章表格同一切片（单量 ≥ `min_n`，不截断）。
+  - **变更单**（无 `p50` 键）：原口径（审批/实施 P50），逐字不变。
   """
   rows = (dept or {}).get('rows') or []
   if not rows:
     return []
+  if any('p50' in r for r in rows):
+    min_n = (dept or {}).get('min_n', 3)
+    rows = [r for r in rows
+            if (r.get('count') or 0) >= min_n or (r.get('prev') or 0) >= min_n]
+    if not rows:
+      return []
+    out = [f'部门维度共 {len(rows)} 个部门（单量 ≥{min_n} 单，按本期单量降序）']
+    for r in rows:
+      diff = '持平' if not r['delta'] else f'{_delta_text(r["delta"])} 单'
+      head = (f'{r["name"]}：本期 {r["count"]} 单（占 {r["pct"]}%），'
+              f'上一期 {r["prev"]} 单（{diff}）')
+      if r.get('p50') is None:
+        dur = '本期处置时长样本少于 3 单'
+      else:
+        dur = (f'本期处置时长 P50 {_human_minutes(r["p50"])}、'
+               f'P90 {_human_minutes(r["p90"])}')
+      if r.get('prev_p50') is not None:
+        dur += f'；上期 P50 {_human_minutes(r["prev_p50"])}'
+        d = r.get('p50_delta')
+        if d is not None:
+          dur += ('，与上期持平' if not d else
+                  f'，较上期{"上升" if d > 0 else "下降"} {_human_minutes(abs(d))}')
+      else:
+        dur += '；上期无同期数据'
+      out.append(f'{head}；{dur}')
+    return out
+  # 变更单等：原有口径（审批/实施 P50）
   # **与第 5 章表格同一切片**：事实里多出的部门，模型会点名，而读者在表里找不到
   total = dept.get('classes') or len(rows)
   rows = rows[:DEPT_TABLE_LIMIT]
