@@ -35,7 +35,11 @@ def load_template_configs() -> None:
       continue
     try:
       config = json.loads(config_path.read_text(encoding='utf-8'))
-      template_img = cv2.imread(str(standard_path))
+      image_bytes = standard_path.read_bytes()
+      template_img = (
+        cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if image_bytes else None
+      )
       if template_img is None:
         logger.warning('无法读取模板图: %s', standard_path)
         continue
